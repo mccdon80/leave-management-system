@@ -14,7 +14,7 @@ export default function AuditLogTab({ data }: { data: AuditLogRow[] }) {
       </div>
 
       <div className="overflow-x-auto">
-        <table className="min-w-[1000px] w-full">
+        <table className="min-w-250 w-full">
           <thead className="bg-neutral-50">
             <tr className="text-xs text-neutral-500">
               <th className="p-3 text-left">Time</th>

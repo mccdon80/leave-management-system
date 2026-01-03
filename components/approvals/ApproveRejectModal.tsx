@@ -45,7 +45,7 @@ export default function ApproveRejectModal({
         <div className="p-4 space-y-2">
           <label className="text-sm font-medium">Notes (optional)</label>
           <textarea
-            className="w-full rounded-md border p-2 text-sm min-h-[100px]"
+            className="w-full rounded-md border p-2 text-sm min-h-25"
             placeholder={
               mode === "APPROVE"
                 ? "Approval notes (optional)"

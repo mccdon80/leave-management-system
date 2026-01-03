@@ -76,7 +76,7 @@ export default function RequestsTable() {
       </div>
 
       <div className="border-t overflow-x-auto">
-        <table className="min-w-[900px] w-full">
+        <table className="min-w-225 w-full">
           <thead className="bg-neutral-50">
             <tr className="text-xs">
               {th("p-3", "Booking")}

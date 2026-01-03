@@ -47,7 +47,7 @@ export default function Stepper({
                 </div>
 
                 {idx !== steps.length - 1 && (
-                  <div className="h-[2px] w-6 bg-neutral-200" />
+                  <div className="h-0.5 w-6 bg-neutral-200" />
                 )}
               </div>
             );
