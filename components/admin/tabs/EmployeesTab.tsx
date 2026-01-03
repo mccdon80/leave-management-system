@@ -95,7 +95,7 @@ export default function EmployeesTab({
       </div>
 
       <div className="overflow-x-auto">
-        <table className="min-w-[1000px] w-full">
+        <table className="min-w-250 w-full">
           <thead className="bg-neutral-50">
             <tr className="text-xs text-neutral-500">
               <th className="p-3 text-left">Name</th>
@@ -158,7 +158,7 @@ export default function EmployeesTab({
         <div className="space-y-2">
           <label className="text-sm font-medium">CSV content</label>
           <textarea
-            className="w-full rounded-md border p-2 text-sm min-h-[220px] font-mono"
+            className="w-full rounded-md border p-2 text-sm min-h-55 font-mono"
             value={csvText}
             onChange={(e) => setCsvText(e.target.value)}
           />

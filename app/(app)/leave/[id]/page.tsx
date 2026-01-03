@@ -507,7 +507,7 @@ export default function LeaveDetailsPage() {
             <div className="p-4 space-y-2">
               <label className="text-sm font-medium">Reason (optional)</label>
               <textarea
-                className="w-full rounded-md border p-2 text-sm min-h-[110px]"
+                className="w-full rounded-md border p-2 text-sm min-h-27.5"
                 value={cancelReason}
                 onChange={(e) => setCancelReason(e.target.value)}
                 placeholder="Add a short reason for audit trail…"
@@ -559,7 +559,7 @@ export default function LeaveDetailsPage() {
             <div className="p-4 space-y-2">
               <label className="text-sm font-medium">Amendment request</label>
               <textarea
-                className="w-full rounded-md border p-2 text-sm min-h-[140px]"
+                className="w-full rounded-md border p-2 text-sm min-h-35"
                 value={amendNote}
                 onChange={(e) => setAmendNote(e.target.value)}
                 placeholder="Example: Please adjust end date to Jan 8 due to medical follow-up…"

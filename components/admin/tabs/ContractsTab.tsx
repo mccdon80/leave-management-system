@@ -472,7 +472,7 @@ export default function ContractsTab({
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="min-w-[900px] w-full">
+                  <table className="min-w-225 w-full">
                     <thead className="bg-neutral-50">
                       <tr className="text-xs text-neutral-500">
                         <th className="p-3 text-left">Department</th>
