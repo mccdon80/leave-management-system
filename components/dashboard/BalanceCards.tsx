@@ -1,14 +1,15 @@
-// components/dashboard/BalanceCards.tsx
 "use client";
 
-type BalanceCardProps = {
+// components/dashboard/BalanceCards.tsx
+export type BalanceCardItem = {
+  code: string;
   title: string;
   value: string;
   subtitle?: string;
   hint?: string;
 };
 
-function BalanceCard({ title, value, subtitle, hint }: BalanceCardProps) {
+function BalanceCard({ title, value, subtitle, hint }: Omit<BalanceCardItem, "code">) {
   return (
     <div className="rounded-xl border bg-white p-4">
       <div className="text-sm text-neutral-500">{title}</div>
@@ -19,34 +20,45 @@ function BalanceCard({ title, value, subtitle, hint }: BalanceCardProps) {
   );
 }
 
-export default function BalanceCards() {
-  // Mock values (later from Supabase balances)
-  const annualRemaining = 18;
-  const carryForwardRemaining = 4;
-  const birthdayRemaining = 1;
+export default function BalanceCards({
+  items,
+  loading,
+}: {
+  items: BalanceCardItem[];
+  loading?: boolean;
+}) {
+  if (loading && items.length === 0) {
+    return (
+      <div className="grid gap-4 md:grid-cols-3">
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
+      </div>
+    );
+  }
 
-  const withinCarryWindow = true; // mock
+  if (!items || items.length === 0) {
+    return (
+      <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">
+        No balance data available yet.
+      </div>
+    );
+  }
+
+  // Show first 3 cards, but keep DB-driven ordering (already sorted by name)
+  const top = items.slice(0, 3);
 
   return (
     <div className="grid gap-4 md:grid-cols-3">
-      <BalanceCard
-        title="Annual leave remaining"
-        value={`${annualRemaining}`}
-        subtitle="Working days"
-        hint="Based on your grade entitlement and approved leaves."
-      />
-      <BalanceCard
-        title="Carry-forward remaining"
-        value={`${carryForwardRemaining}`}
-        subtitle={withinCarryWindow ? "Usable until Mar 31" : "Window closed"}
-        hint="Carry-forward is consumed first in Smart Apply (when allowed)."
-      />
-      <BalanceCard
-        title="Birthday leave"
-        value={`${birthdayRemaining}`}
-        subtitle="Day per year"
-        hint="Non-carry-forward. Limited to 1 per leave year."
-      />
+      {top.map((it) => (
+        <BalanceCard
+          key={it.code}
+          title={it.title}
+          value={it.value}
+          subtitle={it.subtitle}
+          hint={it.hint}
+        />
+      ))}
     </div>
   );
 }

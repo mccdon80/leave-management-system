@@ -38,28 +38,15 @@ function computeWorkingDays(startISO?: string, endISO?: string) {
   return days;
 }
 
-/**
- * Ensures the Leave Wizard always sends DB-valid codes to Supabase.
- * DB leave_types.code valid values: annual | sick | unpaid | other
- */
-function normalizeLeaveTypeCode(input?: string) {
-  if (!input) return undefined;
-  const v = input.trim().toLowerCase();
-
-  // If UI accidentally stores labels, map them
-  if (v === "annual leave") return "annual";
-  if (v === "sick leave") return "sick";
-  if (v === "unpaid leave") return "unpaid";
-  if (v === "other") return "other";
-
-  // If UI stores codes already, keep them
-  if (v === "annual" || v === "sick" || v === "unpaid" || v === "other") return v;
-
-  // Unknown -> return original lowercased (will fail fast and show error)
-  return v;
-}
-
-type LeaveTypeRow = { code: string; name: string };
+type LeaveTypeRow = {
+  code: string; // e.g. "ANNUAL", "SICK_FULL"
+  name: string;
+  requires_attachment: boolean;
+  pay_category?: "FULL" | "HALF" | "UNPAID";
+  requires_reason?: boolean;
+  default_days?: number | null;
+  active?: boolean;
+};
 
 export default function LeaveWizard() {
   const [stepIndex, setStepIndex] = useState(0);
@@ -90,15 +77,25 @@ export default function LeaveWizard() {
       try {
         const { data, error } = await supabase
           .from("leave_types")
-          .select("code,name")
+          .select("code,name,requires_attachment,pay_category,requires_reason,default_days,active")
+          .eq("active", true)
           .order("name", { ascending: true });
 
         if (error) throw error;
 
-        const list = (data ?? []) as LeaveTypeRow[];
+        const list: LeaveTypeRow[] = (data ?? []).map((r: any) => ({
+          code: String(r.code),
+          name: String(r.name),
+          requires_attachment: Boolean(r.requires_attachment),
+          pay_category: r.pay_category,
+          requires_reason: Boolean(r.requires_reason),
+          default_days: r.default_days ?? null,
+          active: Boolean(r.active),
+        }));
+
         setLeaveTypes(list);
 
-        // If user hasn't selected any leave type yet, default to first available
+        // Default to first available leave type code (DB code)
         setState((prev) => {
           if (prev.leaveTypeCode) return prev;
           return { ...prev, leaveTypeCode: list[0]?.code };
@@ -136,6 +133,12 @@ export default function LeaveWizard() {
     setStepIndex((i) => Math.max(i - 1, 0));
   }
 
+  function findSelectedLeaveType(codeMaybe?: string) {
+    const chosen = (codeMaybe ?? "").trim();
+    if (!chosen) return undefined;
+    return leaveTypes.find((t) => t.code.trim().toUpperCase() === chosen.toUpperCase());
+  }
+
   function runSearch() {
     const warnings: string[] = [];
     const blocks: string[] = [];
@@ -144,6 +147,14 @@ export default function LeaveWizard() {
 
     if (workingDays <= 0) {
       blocks.push("Please select a valid date range with at least 1 working day.");
+    }
+
+    // ✅ Attachment enforcement (based on selected leave type in DB)
+    const selectedType = findSelectedLeaveType(state.leaveTypeCode);
+    const requiresAttachment = Boolean(selectedType?.requires_attachment);
+
+    if (requiresAttachment && (state.attachments?.length ?? 0) === 0) {
+      blocks.push("Attachment is required for this leave type.");
     }
 
     // Mock policy logic for UI (keep for now; later replace with Supabase leave_balances + leave_policies)
@@ -192,20 +203,16 @@ export default function LeaveWizard() {
     try {
       setIsSubmitting(true);
 
-      // Normalize type to match leave_types.code FK
-      const leaveType = normalizeLeaveTypeCode(state.leaveTypeCode);
       const startDate = state.startDate;
       const endDate = state.endDate;
       const days = state.workingDays ?? 0;
 
-      // Hard guard: ensure selected leave type exists in DB list (prevents FK error)
-      const allowed = new Set(leaveTypes.map((x) => x.code.toLowerCase()));
-      if (!leaveType || !allowed.has(leaveType)) {
+      // ✅ Use exact DB code (uppercase) to satisfy FK leave_requests.leave_type -> leave_types.code
+      const selected = findSelectedLeaveType(state.leaveTypeCode);
+      if (!selected) {
         setState((prev) => ({
           ...prev,
-          blocks: [
-            `Invalid leave type: "${state.leaveTypeCode}". Please re-select leave type.`,
-          ],
+          blocks: [`Invalid leave type: "${state.leaveTypeCode}". Please re-select leave type.`],
         }));
         return;
       }
@@ -214,6 +221,15 @@ export default function LeaveWizard() {
         setState((prev) => ({
           ...prev,
           blocks: ["Missing or invalid leave details. Please go back and check your dates."],
+        }));
+        return;
+      }
+
+      // ✅ Enforce required attachment at submit time too (safety)
+      if (selected.requires_attachment && (state.attachments?.length ?? 0) === 0) {
+        setState((prev) => ({
+          ...prev,
+          blocks: ["Attachment is required for this leave type. Please go back and upload."],
         }));
         return;
       }
@@ -234,17 +250,18 @@ export default function LeaveWizard() {
       if (profErr) throw profErr;
       const role = (prof as { role: string }).role;
 
-      // 1) Insert draft request (DB trigger will autofill department_id / line_manager_id / general_manager_id)
+      // 1) Insert draft request
       const { data: inserted, error: insErr } = await supabase
         .from("leave_requests")
         .insert({
           requester_id: userId,
-          leave_type: leaveType,
+          leave_type: selected.code, // ✅ FK-safe (e.g. "SICK_FULL")
           start_date: startDate,
           end_date: endDate,
           days,
           reason: state.reason ?? null,
           status: "draft",
+          // attachment_url stays null for now (your UI stores attachments metadata only)
         })
         .select("id,line_manager_id,general_manager_id")
         .single();
@@ -291,7 +308,7 @@ export default function LeaveWizard() {
       // Update wizard confirmation fields
       setState((prev) => ({
         ...prev,
-        bookingRef: leaveId, // show real request id as reference
+        bookingRef: leaveId,
         status: "PENDING",
         blocks: [],
       }));
@@ -299,10 +316,7 @@ export default function LeaveWizard() {
       // Go to CONFIRM step
       setStepIndex(3);
     } catch (e: any) {
-      const msg =
-        typeof e?.message === "string"
-          ? e.message
-          : "Failed to submit leave request. Please try again.";
+      const msg = typeof e?.message === "string" ? e.message : "Failed to submit leave request. Please try again.";
       setState((prev) => ({
         ...prev,
         blocks: [msg],
@@ -327,7 +341,6 @@ export default function LeaveWizard() {
               leaveTypesLoading={leaveTypesLoading}
               leaveTypesError={leaveTypesError}
             />
-
           )}
 
           {currentStep === "OPTIONS" && (

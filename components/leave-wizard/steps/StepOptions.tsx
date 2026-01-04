@@ -7,7 +7,14 @@ type FareKey = "SMART" | "CURRENT_ONLY" | "CARRY_ONLY";
 
 type LeavePayCategory = "FULL" | "HALF" | "UNPAID";
 
-type LeaveTypeRow = { code: string; name: string };
+type LeaveTypeRow = {
+  code: string;
+  name: string;
+  requires_attachment?: boolean;
+  pay_category?: LeavePayCategory;
+  requires_reason?: boolean;
+  default_days?: number | null;
+};
 
 type LeaveTypeConfig = {
   code: string; // MUST match DB leave_types.code
@@ -60,58 +67,16 @@ function moneyRow(label: string, value: string) {
 }
 
 function buildLeaveTypeConfigs(leaveTypes: LeaveTypeRow[]): LeaveTypeConfig[] {
-  // Map DB leave types into richer UI config.
-  // You can later move this into a contract/admin table.
-  return leaveTypes.map((lt) => {
-    const code = lt.code.toLowerCase();
-
-    if (code === "sick") {
-      return {
-        code,
-        name: lt.name,
-        defaultDays: null,
-        payCategory: "FULL",
-        requiresReason: true,
-        requiresAttachment: true,
-        active: true,
-      };
-    }
-
-    if (code === "unpaid") {
-      return {
-        code,
-        name: lt.name,
-        defaultDays: null,
-        payCategory: "UNPAID",
-        requiresReason: true,
-        requiresAttachment: false,
-        active: true,
-      };
-    }
-
-    if (code === "other") {
-      return {
-        code,
-        name: lt.name,
-        defaultDays: null,
-        payCategory: "FULL",
-        requiresReason: true,
-        requiresAttachment: false,
-        active: true,
-      };
-    }
-
-    // annual (default)
-    return {
-      code,
-      name: lt.name,
-      defaultDays: null,
-      payCategory: "FULL",
-      requiresReason: false,
-      requiresAttachment: false,
-      active: true,
-    };
-  });
+  // Prefer DB columns; fallback to safe defaults
+  return leaveTypes.map((lt) => ({
+    code: lt.code, // keep exact DB code (uppercase)
+    name: lt.name,
+    defaultDays: lt.default_days ?? null,
+    payCategory: (lt.pay_category ?? "FULL") as LeavePayCategory,
+    requiresReason: Boolean(lt.requires_reason),
+    requiresAttachment: Boolean(lt.requires_attachment),
+    active: true,
+  }));
 }
 
 function FareCardView({
@@ -203,14 +168,13 @@ export default function StepOptions({
 
   const leaveTypeConfigs = useMemo(() => buildLeaveTypeConfigs(leaveTypes ?? []), [leaveTypes]);
 
-  // Ensure we always have a DB-valid leaveTypeCode
-  const allowedCodes = useMemo(() => new Set(leaveTypeConfigs.map((x) => x.code)), [leaveTypeConfigs]);
-
-  const leaveTypeCode = (state.leaveTypeCode ?? leaveTypeConfigs[0]?.code ?? "annual").toLowerCase();
+  // Leave type comes from StepSearch
+  const chosen = (state.leaveTypeCode ?? "").trim();
 
   const leaveType =
-    leaveTypeConfigs.find((t) => t.code === leaveTypeCode) ?? leaveTypeConfigs[0] ?? {
-      code: "annual",
+    leaveTypeConfigs.find((t) => t.code.toUpperCase() === chosen.toUpperCase()) ??
+    leaveTypeConfigs[0] ?? {
+      code: "ANNUAL",
       name: "Annual Leave",
       defaultDays: null,
       payCategory: "FULL" as const,
@@ -219,23 +183,13 @@ export default function StepOptions({
       active: true,
     };
 
-  // If state has an invalid value (old hardcoded label), reset it silently
-  if (state.leaveTypeCode && !allowedCodes.has(leaveTypeCode) && leaveTypeConfigs.length > 0) {
-    // NOTE: This runs during render; keep it safe by only correcting when necessary.
-    // If you prefer, move it into a useEffect.
-    setTimeout(() => {
-      setState({ ...state, leaveTypeCode: leaveTypeConfigs[0].code });
-    }, 0);
-  }
+  const missingLeaveType = leaveTypeConfigs.length > 0 && !state.leaveTypeCode;
 
   const pay = leaveType.payCategory;
-  const fixedDays = leaveType.defaultDays; // null if not fixed
+  const fixedDays = leaveType.defaultDays;
   const isFixed = typeof fixedDays === "number" && fixedDays > 0;
-
-  // Fixed duration rule (UI-first)
   const fixedMismatch = isFixed && days > 0 && days !== fixedDays;
 
-  // Balance logic for cards
   const canUseCarry = withinCarry && cf > 0;
   const canUseCurrent = cy > 0;
 
@@ -256,33 +210,38 @@ export default function StepOptions({
       name: "Smart Apply",
       tagline: "Best value — automatically uses the correct buckets.",
       recommended: true,
-      disabled: !(days > 0) || (days > 0 && smartCarry + smartCurrent !== days),
-      disabledReason:
-        days > 0 && smartCarry + smartCurrent !== days
-          ? "Insufficient balance across buckets for these dates."
-          : undefined,
+      disabled: missingLeaveType || !(days > 0) || (days > 0 && smartCarry + smartCurrent !== days),
+      disabledReason: missingLeaveType
+        ? "Please go back and select a leave type."
+        : days > 0 && smartCarry + smartCurrent !== days
+        ? "Insufficient balance across buckets for these dates."
+        : undefined,
       breakdown: { carryForward: smartCarry, currentYear: smartCurrent },
       bullets: [
-        { label: pay === "FULL" ? "Full pay" : pay === "HALF" ? "Half pay" : "Unpaid", tone: pay === "FULL" ? "good" : pay === "HALF" ? "warn" : "neutral" },
+        {
+          label: pay === "FULL" ? "Full pay" : pay === "HALF" ? "Half pay" : "Unpaid",
+          tone: pay === "FULL" ? "good" : pay === "HALF" ? "warn" : "neutral",
+        },
         ...(isFixed ? [{ label: `Fixed: ${fixedDays} day(s)`, tone: "info" as const }] : []),
       ],
       rationale: [
         "Uses carry-forward first (within allowed window), then current-year balance.",
         "Reduces the risk of losing carry-forward days after expiry.",
-        ...(fixedMismatch ? [`Warning: ${leaveType.name} usually defaults to ${fixedDays} day(s).`] : []),
+        ...(fixedMismatch ? [`Warning: ${leaveType.name} defaults to ${fixedDays} day(s).`] : []),
       ],
     },
     {
       key: "CURRENT_ONLY",
       name: "Current-year Only",
       tagline: "Use only current-year balance.",
-      disabled: !(days > 0) || !canUseCurrent || currentOnlyCurrent !== days,
-      disabledReason:
-        !canUseCurrent
-          ? "No current-year balance available."
-          : currentOnlyCurrent !== days
-          ? "Not enough current-year balance."
-          : undefined,
+      disabled: missingLeaveType || !(days > 0) || !canUseCurrent || currentOnlyCurrent !== days,
+      disabledReason: missingLeaveType
+        ? "Please go back and select a leave type."
+        : !canUseCurrent
+        ? "No current-year balance available."
+        : currentOnlyCurrent !== days
+        ? "Not enough current-year balance."
+        : undefined,
       breakdown: { carryForward: currentOnlyCarry, currentYear: currentOnlyCurrent },
       bullets: [
         { label: "Uses current-year only", tone: "info" },
@@ -291,22 +250,23 @@ export default function StepOptions({
       rationale: [
         "Keeps carry-forward untouched.",
         ...(canUseCarry ? ["Note: carry-forward may expire after March 31 (policy-based)."] : []),
-        ...(fixedMismatch ? [`Warning: ${leaveType.name} usually defaults to ${fixedDays} day(s).`] : []),
+        ...(fixedMismatch ? [`Warning: ${leaveType.name} defaults to ${fixedDays} day(s).`] : []),
       ],
     },
     {
       key: "CARRY_ONLY",
       name: "Carry-forward Only",
       tagline: "Use only carry-forward balance (if allowed).",
-      disabled: !(days > 0) || !canUseCarry || carryOnlyCarry !== days,
-      disabledReason:
-        !withinCarry
-          ? "Carry-forward window expired."
-          : !canUseCarry
-          ? "No carry-forward balance available."
-          : carryOnlyCarry !== days
-          ? "Not enough carry-forward balance."
-          : undefined,
+      disabled: missingLeaveType || !(days > 0) || !canUseCarry || carryOnlyCarry !== days,
+      disabledReason: missingLeaveType
+        ? "Please go back and select a leave type."
+        : !withinCarry
+        ? "Carry-forward window expired."
+        : !canUseCarry
+        ? "No carry-forward balance available."
+        : carryOnlyCarry !== days
+        ? "Not enough carry-forward balance."
+        : undefined,
       breakdown: { carryForward: carryOnlyCarry, currentYear: carryOnlyCurrent },
       bullets: [
         { label: "Uses carry-forward only", tone: "info" },
@@ -315,7 +275,7 @@ export default function StepOptions({
       rationale: [
         "Helps consume carry-forward before expiry.",
         `LM → Escalate to GM (${slaDue})`,
-        ...(fixedMismatch ? [`Warning: ${leaveType.name} usually defaults to ${fixedDays} day(s).`] : []),
+        ...(fixedMismatch ? [`Warning: ${leaveType.name} defaults to ${fixedDays} day(s).`] : []),
       ],
     },
   ];
@@ -338,28 +298,13 @@ export default function StepOptions({
     });
   }
 
-  function onSelectLeaveType(code: string) {
-    const normalized = code.toLowerCase();
-    setState({
-      ...state,
-      leaveTypeCode: normalized,
-      // reset selection because rules/balances may change by type
-      selectedOption: undefined,
-      breakdown: undefined,
-      warnings: [],
-      blocks: [],
-    });
-  }
-
   return (
     <div className="rounded-2xl border bg-white p-5">
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="text-sm text-neutral-500">Step 2</div>
           <div className="text-xl font-semibold">Choose your option</div>
-          <div className="text-sm text-neutral-500">
-            Select the leave type (from Supabase) and pick how to use your balance.
-          </div>
+          <div className="text-sm text-neutral-500">Pick how to use your balance buckets. (Leave type chosen in Step 1.)</div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -369,9 +314,9 @@ export default function StepOptions({
       </div>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-[320px_1fr]">
-        {/* Left panel */}
+        {/* Left panel (no dropdown) */}
         <div className="rounded-xl border bg-neutral-50 p-4">
-          <div className="text-sm font-medium text-neutral-900">Leave Type</div>
+          <div className="text-sm font-medium text-neutral-900">Selected Leave Type</div>
 
           {leaveTypesLoading ? (
             <div className="mt-2 text-sm text-neutral-500">Loading leave types…</div>
@@ -379,25 +324,14 @@ export default function StepOptions({
             <div className="mt-2 text-sm text-red-600">{leaveTypesError}</div>
           ) : null}
 
-          <select
-            className="mt-2 w-full rounded-md border bg-white px-3 py-2 text-sm"
-            value={leaveType.code}
-            onChange={(e) => onSelectLeaveType(e.target.value)}
-            disabled={leaveTypesLoading || leaveTypeConfigs.length === 0}
-          >
-            {leaveTypeConfigs.map((lt) => (
-              <option key={lt.code} value={lt.code}>
-                {lt.name}
-              </option>
-            ))}
-          </select>
+          <div className="mt-2 rounded-md border bg-white px-3 py-2 text-sm">
+            {missingLeaveType ? "— (go back to Step 1)" : leaveType.name}
+          </div>
 
           <div className="mt-4 space-y-2 text-sm">
             {moneyRow("Current-year remaining", `${cy} day(s)`)}
             {moneyRow("Carry-forward remaining", `${cf} day(s)`)}
-            <div className="text-xs text-neutral-500">
-              Carry-forward window: {withinCarry ? "Active" : "Expired"}
-            </div>
+            <div className="text-xs text-neutral-500">Carry-forward window: {withinCarry ? "Active" : "Expired"}</div>
           </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
@@ -411,12 +345,12 @@ export default function StepOptions({
 
           {fixedMismatch ? (
             <div className="mt-4 text-xs rounded-md p-2 bg-amber-50 text-amber-900 border border-amber-200">
-              {leaveType.name} normally defaults to {fixedDays} day(s), but your selection is {days} day(s).
+              {leaveType.name} defaults to {fixedDays} day(s), but your selection is {days} day(s).
             </div>
           ) : null}
 
           <div className="mt-4 text-xs text-neutral-500">
-            Note: Pay category / rules are currently UI defaults. Later we can move these into admin contract settings.
+            Rules shown here are read from the leave_types table (pay_category / requires_reason / requires_attachment / default_days).
           </div>
         </div>
 

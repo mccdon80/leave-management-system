@@ -1,10 +1,10 @@
-// components/dashboard/RequestsTable.tsx
 "use client";
 
+// components/dashboard/RequestsTable.tsx
 import Link from "next/link";
 import StatusBadge from "@/components/shared/StatusBadge";
 
-type RequestRow = {
+export type RequestRow = {
   id: string;
   bookingRef: string;
   leaveType: string;
@@ -15,56 +15,23 @@ type RequestRow = {
   approver: string;
 };
 
-const mockRequests: RequestRow[] = [
-  {
-    id: "1",
-    bookingRef: "LV-2026-000123",
-    leaveType: "Annual",
-    startDate: "2026-01-12",
-    endDate: "2026-01-16",
-    workingDays: 5,
-    status: "PENDING",
-    approver: "Ahmed (Line Manager)",
-  },
-  {
-    id: "2",
-    bookingRef: "LV-2026-000101",
-    leaveType: "Birthday",
-    startDate: "2026-01-05",
-    endDate: "2026-01-05",
-    workingDays: 1,
-    status: "APPROVED",
-    approver: "Ahmed (Line Manager)",
-  },
-  {
-    id: "3",
-    bookingRef: "LV-2025-000987",
-    leaveType: "Annual",
-    startDate: "2025-12-20",
-    endDate: "2025-12-24",
-    workingDays: 4,
-    status: "REJECTED",
-    approver: "Ahmed (Line Manager)",
-  },
-];
-
 function th(cls: string, label: string) {
-  return (
-    <th className={["text-left text-xs font-medium text-neutral-500", cls].join(" ")}>
-      {label}
-    </th>
-  );
+  return <th className={["text-left text-xs font-medium text-neutral-500", cls].join(" ")}>{label}</th>;
 }
 
-export default function RequestsTable() {
+export default function RequestsTable({
+  rows,
+  loading,
+}: {
+  rows: RequestRow[];
+  loading?: boolean;
+}) {
   return (
     <div className="rounded-xl border bg-white">
       <div className="p-4 flex items-start justify-between gap-3">
         <div>
           <div className="font-semibold">Recent requests</div>
-          <div className="text-sm text-neutral-500 mt-1">
-            Track approvals, escalations, and actions.
-          </div>
+          <div className="text-sm text-neutral-500 mt-1">Track approvals, escalations, and actions.</div>
         </div>
 
         <Link
@@ -90,7 +57,23 @@ export default function RequestsTable() {
           </thead>
 
           <tbody>
-            {mockRequests.map((r) => (
+            {loading && (!rows || rows.length === 0) ? (
+              <tr className="border-t">
+                <td className="p-6 text-sm text-neutral-500" colSpan={7}>
+                  Loading requests…
+                </td>
+              </tr>
+            ) : null}
+
+            {!loading && (!rows || rows.length === 0) ? (
+              <tr className="border-t">
+                <td className="p-6 text-sm text-neutral-500" colSpan={7}>
+                  No requests yet. Book your first leave to see it here.
+                </td>
+              </tr>
+            ) : null}
+
+            {(rows ?? []).map((r) => (
               <tr key={r.id} className="border-t">
                 <td className="p-3">
                   <div className="font-mono text-sm font-semibold">{r.bookingRef}</div>
@@ -100,7 +83,9 @@ export default function RequestsTable() {
                 <td className="p-3 text-sm">{r.leaveType}</td>
 
                 <td className="p-3 text-sm">
-                  <div className="font-medium">{r.startDate} → {r.endDate}</div>
+                  <div className="font-medium">
+                    {r.startDate} → {r.endDate}
+                  </div>
                   <div className="text-xs text-neutral-500">Working days (Mon–Fri)</div>
                 </td>
 
@@ -122,14 +107,6 @@ export default function RequestsTable() {
                 </td>
               </tr>
             ))}
-
-            {mockRequests.length === 0 ? (
-              <tr className="border-t">
-                <td className="p-6 text-sm text-neutral-500" colSpan={7}>
-                  No requests yet. Book your first leave to see it here.
-                </td>
-              </tr>
-            ) : null}
           </tbody>
         </table>
       </div>

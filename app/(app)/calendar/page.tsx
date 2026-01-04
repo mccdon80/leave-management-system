@@ -33,43 +33,39 @@ function startOfMonth(year: number, monthIndex0: number) {
 }
 
 function endOfMonth(year: number, monthIndex0: number) {
-  // Day 0 of next month = last day of current month
   return new Date(year, monthIndex0 + 1, 0);
 }
 
-function mapDbStatusToUi(status: string): "APPROVED" | "PENDING" | null {
-  const s = status.toLowerCase();
+function mapDbStatusToUi(status: string): CalendarLeaveEvent["status"] | null {
+  const s = (status ?? "").toLowerCase();
+
   if (s === "approved") return "APPROVED";
   if (s.startsWith("pending")) return "PENDING";
-  // Ignore: draft / rejected / cancelled / etc.
+  if (s === "rejected") return "REJECTED";
+  if (s === "cancelled") return "CANCELLED";
+
+  // Ignore draft, submitted, etc
   return null;
 }
 
-function mapDbLeaveTypeToUi(code: string): "Annual" | "Birthday" | "Sick" {
-  // Your UI type union is currently: Annual | Birthday | Sick (from mockData.ts)
-  // DB codes: annual | sick | unpaid | other
-  const c = (code ?? "").toLowerCase();
-  if (c === "sick") return "Sick";
-  // no "Birthday" in DB right now, so we map everything else to Annual
-  return "Annual";
-}
+type LeaveTypeOption = { code: string; name: string };
 
 type DbRow = {
   id: string;
   requester_id: string;
   start_date: string; // YYYY-MM-DD
   end_date: string; // YYYY-MM-DD
-  leave_type: string;
+  leave_type: string; // leave_types.code
   status: string;
-  days: number;
   requester?: { full_name: string | null; email: string | null } | null;
   dept?: { name: string | null } | null;
+  lt?: { code: string | null; name: string | null } | null;
 };
 
 export default function CalendarPage() {
   // Month state
-  const [year, setYear] = useState(2026);
-  const [monthIndex0, setMonthIndex0] = useState(0); // Jan
+  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [monthIndex0, setMonthIndex0] = useState(() => new Date().getMonth());
 
   // Week anchor
   const [anchorDateISO, setAnchorDateISO] = useState(() => toISODate(new Date()));
@@ -85,12 +81,16 @@ export default function CalendarPage() {
     query: "",
   });
 
+  // Leave types for filter dropdown (DB)
+  const [leaveTypes, setLeaveTypes] = useState<LeaveTypeOption[]>([]);
+  const [leaveTypesLoading, setLeaveTypesLoading] = useState(false);
+
   // Supabase-backed events
   const [events, setEvents] = useState<CalendarLeaveEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Departments list for filter dropdown
+  // Departments list for filter dropdown (derived from events for now)
   const departments = useMemo(() => {
     const set = new Set<string>();
     events.forEach((e) => set.add(e.department));
@@ -104,6 +104,35 @@ export default function CalendarPage() {
     const end = addDays(start, 6);
     return { start, end };
   }, [anchorDateISO]);
+
+  // Load leave types (for filter dropdown)
+  useEffect(() => {
+    async function loadTypes() {
+      setLeaveTypesLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from("leave_types")
+          .select("code,name")
+          .eq("active", true)
+          .order("name", { ascending: true });
+
+        if (error) throw error;
+
+        setLeaveTypes(
+          (data ?? []).map((r: any) => ({
+            code: String(r.code),
+            name: String(r.name),
+          }))
+        );
+      } catch {
+        setLeaveTypes([]);
+      } finally {
+        setLeaveTypesLoading(false);
+      }
+    }
+
+    loadTypes();
+  }, []);
 
   // Fetch events whenever visible range changes (month/week) or view toggles
   useEffect(() => {
@@ -124,24 +153,24 @@ export default function CalendarPage() {
         }
 
         // Overlap condition: start_date <= to AND end_date >= from
-        // Join profiles + departments for display labels (if FK relationships exist)
+        // Join profiles + departments + leave_types for display labels
         const { data, error } = await supabase
           .from("leave_requests")
-          .select(`
-              id,
-              requester_id,
-              start_date,
-              end_date,
-              leave_type,
-              status,
-              days,
-              requester:profiles!leave_requests_requester_id_fkey(full_name,email),
-              approver:profiles!leave_requests_current_approver_id_fkey(full_name,email),
-              dept:departments!leave_requests_department_id_fkey(name)
-            `)
+          .select(
+            `
+            id,
+            requester_id,
+            start_date,
+            end_date,
+            leave_type,
+            status,
+            requester:profiles!leave_requests_requester_id_fkey(full_name,email),
+            dept:departments!leave_requests_department_id_fkey(name),
+            lt:leave_types!leave_requests_leave_type_fkey(code,name)
+          `
+          )
           .lte("start_date", to)
           .gte("end_date", from)
-          .in("status", ["pending_lm", "pending_gm", "approved"])
           .order("start_date", { ascending: true });
 
         if (error) throw error;
@@ -157,15 +186,17 @@ export default function CalendarPage() {
               r.requester?.email?.trim() ||
               r.requester_id.slice(0, 8);
 
-            const department =
-              r.dept?.name?.trim() ||
-              "Department";
+            const department = r.dept?.name?.trim() || "Department";
+
+            const leaveTypeName =
+              r.lt?.name?.trim() ||
+              r.leave_type; // fallback to code if join missing
 
             return {
               id: r.id,
               employeeName,
               department,
-              leaveType: mapDbLeaveTypeToUi(r.leave_type),
+              leaveType: leaveTypeName,
               status: uiStatus,
               startDate: r.start_date,
               endDate: r.end_date,
@@ -193,8 +224,6 @@ export default function CalendarPage() {
       if (filters.leaveType !== "ALL" && ev.leaveType !== filters.leaveType) return false;
       if (filters.department !== "ALL" && ev.department !== filters.department) return false;
       if (q && !ev.employeeName.toLowerCase().includes(q)) return false;
-
-      // only include leaves that overlap the selected day in sidebar? (No — sidebar handles that)
       return true;
     });
   }, [events, filters]);
@@ -246,7 +275,12 @@ export default function CalendarPage() {
 
   return (
     <div className="space-y-4">
-      <CalendarFilters filters={filters} setFilters={setFilters} departments={departments} />
+      <CalendarFilters
+        filters={filters}
+        setFilters={setFilters}
+        departments={departments}
+        leaveTypes={leaveTypesLoading ? [] : leaveTypes}
+      />
 
       {(loading || loadError) && (
         <div className="rounded-xl border bg-white p-3 text-sm">
@@ -264,14 +298,14 @@ export default function CalendarPage() {
             <CalendarGrid
               year={year}
               monthIndex0={monthIndex0}
-              events={filteredEvents as CalendarLeaveEvent[]}
+              events={filteredEvents}
               onPrev={prevMonth}
               onNext={nextMonth}
               onToday={goTodayMonth}
             />
           ) : (
             <WeekView
-              events={filteredEvents as CalendarLeaveEvent[]}
+              events={filteredEvents}
               anchorDateISO={anchorDateISO}
               onPrevWeek={prevWeek}
               onNextWeek={nextWeek}
@@ -280,7 +314,7 @@ export default function CalendarPage() {
           )}
         </div>
 
-        <WhosOffSidebar events={filteredEvents as CalendarLeaveEvent[]} selectedDateISO={selectedDateISO} />
+        <WhosOffSidebar events={filteredEvents} selectedDateISO={selectedDateISO} />
       </div>
     </div>
   );

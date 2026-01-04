@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { WizardState } from "../SummaryPanel";
 
-type LeaveTypeRow = { code: string; name: string };
+type LeaveTypeRow = { code: string; name: string; requires_attachment?: boolean };
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
@@ -70,7 +70,7 @@ function Banner({
   children,
 }: {
   tone: "info" | "warn" | "error";
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   const cls =
     tone === "error"
@@ -106,7 +106,7 @@ export default function StepSearch({
 }) {
   const activeLeaveTypes = useMemo(() => (leaveTypes ?? []).filter(Boolean), [leaveTypes]);
 
-  // ✅ use DB code
+  // DB code (keep as-is, e.g. "SICK_FULL")
   const [leaveTypeCode, setLeaveTypeCode] = useState<string>(state.leaveTypeCode ?? "");
 
   const [startDate, setStartDate] = useState<string>(state.startDate ?? "");
@@ -117,7 +117,7 @@ export default function StepSearch({
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Track if user manually edited end date (so we don't fight them)
+  // Track if user manually edited end date
   const [endManuallySet, setEndManuallySet] = useState<boolean>(false);
 
   // Sync local state from wizard when navigating back/forward
@@ -145,6 +145,24 @@ export default function StepSearch({
   const currentYearRemaining = 18; // mock
   const carryForwardRemaining = withinCarryWindow ? 4 : 0; // mock
 
+  // ✅ Determine if attachments are required for selected leave type
+  const requiresAttachment = useMemo(() => {
+    const selected = activeLeaveTypes.find((t) => t.code === leaveTypeCode);
+    return Boolean(selected?.requires_attachment);
+  }, [activeLeaveTypes, leaveTypeCode]);
+
+  // ✅ If user switches to a type that does NOT require attachments, clear attachment state
+  useEffect(() => {
+    if (!requiresAttachment) {
+      if (files.length > 0 || (state.attachments?.length ?? 0) > 0) {
+        setFiles([]);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        setState({ ...state, attachments: [] });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requiresAttachment]);
+
   const blocks: string[] = [];
   const warnings: string[] = [];
 
@@ -152,13 +170,17 @@ export default function StepSearch({
     blocks.push("Please select a leave type.");
   }
 
-  // Blocking: invalid date order
   if (startDate && endDate && fromISODate(endDate) < fromISODate(startDate)) {
     blocks.push("End date cannot be before start date.");
   }
 
   if (withinCarryWindow && carryForwardRemaining > 0) {
     warnings.push("Carry-forward expires on Mar 31 (policy).");
+  }
+
+  // ✅ Blocking: attachment required but none uploaded
+  if (requiresAttachment && (state.attachments?.length ?? 0) === 0) {
+    blocks.push("Attachment is required for this leave type.");
   }
 
   function pickFiles(next: FileList | null) {
@@ -205,7 +227,7 @@ export default function StepSearch({
   function runSearch() {
     const next: WizardState = {
       ...state,
-      leaveTypeCode, // ✅ DB code from dropdown
+      leaveTypeCode,
       startDate,
       endDate,
       reason,
@@ -258,7 +280,16 @@ export default function StepSearch({
                 onChange={(e) => {
                   const code = e.target.value;
                   setLeaveTypeCode(code);
-                  setState({ ...state, leaveTypeCode: code });
+
+                  const req = Boolean(activeLeaveTypes.find((t) => t.code === code)?.requires_attachment);
+                  if (!req) {
+                    setFiles([]);
+                    if (fileInputRef.current) fileInputRef.current.value = "";
+                    setState({ ...state, leaveTypeCode: code, attachments: [] });
+                  } else {
+                    setState({ ...state, leaveTypeCode: code });
+                  }
+
                   setEndManuallySet(false);
                 }}
                 disabled={leaveTypesLoading || activeLeaveTypes.length === 0}
@@ -323,70 +354,73 @@ export default function StepSearch({
             </div>
           </div>
 
-          {/* Attachment UI (still local for MVP) */}
-          <div className="rounded-lg border p-4 space-y-3">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="font-medium text-sm">Attachment (optional)</div>
-                <div className="text-sm text-neutral-500 mt-1">
-                  For MVP this stays local; later we’ll upload to Supabase Storage.
-                </div>
-              </div>
-
-              <button
-                type="button"
-                className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                Upload
-              </button>
-            </div>
-
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              className="hidden"
-              onChange={(e) => pickFiles(e.target.files)}
-            />
-
-            {files.length === 0 ? (
-              <div className="rounded-md border border-dashed p-4 text-sm text-neutral-500">
-                No files uploaded yet. Click <span className="font-medium">Upload</span> to add documents.
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <div className="text-xs text-neutral-500">
-                  {files.length} file(s) • Total: {formatBytes(totalAttachmentBytes)}
+          {/* ✅ Attachment UI ONLY when required */}
+          {requiresAttachment ? (
+            <div className="rounded-lg border p-4 space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="font-medium text-sm">Attachment (required)</div>
+                  <div className="text-sm text-neutral-500 mt-1">
+                    For MVP this stays local; later we’ll upload to Supabase Storage.
+                  </div>
                 </div>
 
-                <div className="divide-y rounded-md border">
-                  {files.map((f, idx) => (
-                    <div
-                      key={`${f.name}-${f.size}-${f.lastModified}`}
-                      className="p-3 flex items-center justify-between gap-3"
-                    >
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium truncate">{f.name}</div>
-                        <div className="text-xs text-neutral-500">
-                          {formatBytes(f.size)}
-                          {f.type ? ` • ${f.type}` : ""}
-                        </div>
-                      </div>
+                <button
+                  type="button"
+                  className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Upload
+                </button>
+              </div>
 
-                      <button
-                        type="button"
-                        className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
-                        onClick={() => removeFile(idx)}
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => pickFiles(e.target.files)}
+              />
+
+              {files.length === 0 ? (
+                <div className="rounded-md border border-dashed p-4 text-sm text-red-600">
+                  No files uploaded yet. Attachment is required. Click <span className="font-medium">Upload</span> to add
+                  documents.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-xs text-neutral-500">
+                    {files.length} file(s) • Total: {formatBytes(totalAttachmentBytes)}
+                  </div>
+
+                  <div className="divide-y rounded-md border">
+                    {files.map((f, idx) => (
+                      <div
+                        key={`${f.name}-${f.size}-${f.lastModified}`}
+                        className="p-3 flex items-center justify-between gap-3"
                       >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium truncate">{f.name}</div>
+                          <div className="text-xs text-neutral-500">
+                            {formatBytes(f.size)}
+                            {f.type ? ` • ${f.type}` : ""}
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
+                          onClick={() => removeFile(idx)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          ) : null}
 
           <div className="flex items-center justify-end gap-2 border-t pt-4">
             <button
