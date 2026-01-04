@@ -3,25 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { WizardState } from "../SummaryPanel";
 
-// Mock leave types (UI-first). Later: fetch from Supabase (contract-scoped)
-type LeavePayCategory = "FULL" | "HALF" | "UNPAID";
-type LeaveTypeConfig = {
-  code: string;
-  name: string;
-  defaultDays: number | null;
-  payCategory: LeavePayCategory;
-  requiresReason: boolean;
-  requiresAttachment: boolean;
-  active: boolean;
-};
-
-const MOCK_LEAVE_TYPES: LeaveTypeConfig[] = [
-  { code: "ANNUAL", name: "Annual", defaultDays: null, payCategory: "FULL", requiresReason: false, requiresAttachment: false, active: true },
-  { code: "BIRTHDAY", name: "Birthday", defaultDays: 1, payCategory: "FULL", requiresReason: false, requiresAttachment: false, active: true },
-  { code: "SICK_FULL", name: "Sick Leave (Full Pay)", defaultDays: null, payCategory: "FULL", requiresReason: true, requiresAttachment: true, active: true },
-  { code: "SICK_HALF", name: "Sick Leave (Half Pay)", defaultDays: null, payCategory: "HALF", requiresReason: true, requiresAttachment: true, active: true },
-  { code: "COMPASSIONATE", name: "Compassionate Leave", defaultDays: 3, payCategory: "FULL", requiresReason: true, requiresAttachment: false, active: true },
-];
+type LeaveTypeRow = { code: string; name: string };
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
@@ -111,14 +93,22 @@ export default function StepSearch({
   state,
   setState,
   onSearch,
+  leaveTypes,
+  leaveTypesLoading,
+  leaveTypesError,
 }: {
   state: WizardState;
   setState: (next: WizardState) => void;
   onSearch?: () => void;
+  leaveTypes: LeaveTypeRow[];
+  leaveTypesLoading?: boolean;
+  leaveTypesError?: string | null;
 }) {
-  const leaveTypes = useMemo(() => MOCK_LEAVE_TYPES.filter((x) => x.active), []);
+  const activeLeaveTypes = useMemo(() => (leaveTypes ?? []).filter(Boolean), [leaveTypes]);
 
-  const [leaveTypeCode, setLeaveTypeCode] = useState<string>(state.leaveTypeCode ?? "ANNUAL");
+  // ✅ use DB code
+  const [leaveTypeCode, setLeaveTypeCode] = useState<string>(state.leaveTypeCode ?? "");
+
   const [startDate, setStartDate] = useState<string>(state.startDate ?? "");
   const [endDate, setEndDate] = useState<string>(state.endDate ?? "");
   const [reason, setReason] = useState<string>(state.reason ?? "");
@@ -130,52 +120,24 @@ export default function StepSearch({
   // Track if user manually edited end date (so we don't fight them)
   const [endManuallySet, setEndManuallySet] = useState<boolean>(false);
 
-  const selectedType = useMemo(
-    () => leaveTypes.find((t) => t.code === leaveTypeCode) ?? leaveTypes[0],
-    [leaveTypes, leaveTypeCode]
-  );
-
-  const requiresReason = selectedType?.requiresReason ?? false;
-  const requiresAttachment = selectedType?.requiresAttachment ?? false;
-
-  // Clear attachments when switching to a type that doesn't require attachment (optional UX)
+  // Sync local state from wizard when navigating back/forward
   useEffect(() => {
-    if (!requiresAttachment && files.length > 0) {
-      setFiles([]);
-      setState({ ...state, attachments: [] });
+    setLeaveTypeCode(state.leaveTypeCode ?? "");
+    setStartDate(state.startDate ?? "");
+    setEndDate(state.endDate ?? "");
+    setReason(state.reason ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.leaveTypeCode, state.startDate, state.endDate, state.reason]);
+
+  // If leave types load and user hasn't picked any yet, choose first
+  useEffect(() => {
+    if (!leaveTypeCode && activeLeaveTypes.length > 0) {
+      const first = activeLeaveTypes[0].code;
+      setLeaveTypeCode(first);
+      setState({ ...state, leaveTypeCode: first });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requiresAttachment]);
-
-  // When leave type changes, if it has defaultDays AND user hasn't manually set end date,
-  // auto-calculate end date from start date.
-  useEffect(() => {
-    if (!selectedType) return;
-    if (!startDate) return;
-
-    if (selectedType.defaultDays && !endManuallySet) {
-      const computed = addWorkingDays(startDate, selectedType.defaultDays);
-      setEndDate(computed);
-    }
-
-    // Sync wizard state basics
-    setState({
-      ...state,
-      leaveTypeCode,
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leaveTypeCode]);
-
-  // When start date changes, recompute end date if defaultDays exists (and not manually set)
-  useEffect(() => {
-    if (!selectedType) return;
-
-    if (startDate && selectedType.defaultDays && !endManuallySet) {
-      setEndDate(addWorkingDays(startDate, selectedType.defaultDays));
-    }
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startDate]);
+  }, [activeLeaveTypes.length]);
 
   const workingDays = useMemo(() => countWorkingDays(startDate, endDate), [startDate, endDate]);
 
@@ -186,44 +148,22 @@ export default function StepSearch({
   const blocks: string[] = [];
   const warnings: string[] = [];
 
+  if (!leaveTypeCode) {
+    blocks.push("Please select a leave type.");
+  }
+
   // Blocking: invalid date order
   if (startDate && endDate && fromISODate(endDate) < fromISODate(startDate)) {
     blocks.push("End date cannot be before start date.");
-  }
-
-  // Birthday leave rules (UI-first example)
-  if (leaveTypeCode === "BIRTHDAY" && workingDays > 1) {
-    blocks.push("Birthday leave is limited to 1 working day.");
-  }
-
-  // Optional warning for fixed duration mismatch (except birthday is blocked above)
-  if (
-    selectedType?.defaultDays &&
-    workingDays > 0 &&
-    leaveTypeCode !== "BIRTHDAY" &&
-    workingDays !== selectedType.defaultDays
-  ) {
-    warnings.push(`${selectedType.name} default duration is ${selectedType.defaultDays} day(s). You selected ${workingDays} day(s).`);
   }
 
   if (withinCarryWindow && carryForwardRemaining > 0) {
     warnings.push("Carry-forward expires on Mar 31 (policy).");
   }
 
-  // Blocking: attachment required but none uploaded
-  if (requiresAttachment && files.length === 0) {
-    blocks.push("Attachment is required for this leave type.");
-  }
-
-  // Blocking (UI-first): reason required but empty
-  if (requiresReason && !reason.trim()) {
-    blocks.push("Reason is required for this leave type.");
-  }
-
   function pickFiles(next: FileList | null) {
     if (!next) return;
 
-    // Avoid duplicates by (name + size + lastModified)
     const existing = new Set(files.map((f) => `${f.name}-${f.size}-${f.lastModified}`));
 
     const incoming = Array.from(next).filter((f) => {
@@ -236,7 +176,6 @@ export default function StepSearch({
     const merged = [...files, ...incoming];
     setFiles(merged);
 
-    // Save metadata into wizard state
     const meta: FileMeta[] = merged.map((f) => ({
       name: f.name,
       size: f.size,
@@ -246,7 +185,6 @@ export default function StepSearch({
 
     setState({ ...state, attachments: meta });
 
-    // reset input to allow re-selecting the same file
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
@@ -267,7 +205,7 @@ export default function StepSearch({
   function runSearch() {
     const next: WizardState = {
       ...state,
-      leaveTypeCode,
+      leaveTypeCode, // ✅ DB code from dropdown
       startDate,
       endDate,
       reason,
@@ -277,7 +215,7 @@ export default function StepSearch({
       carryForwardRemaining,
       blocks,
       warnings,
-      attachments: (state.attachments ?? []), // already set when picking files
+      attachments: state.attachments ?? [],
     };
 
     setState(next);
@@ -288,6 +226,9 @@ export default function StepSearch({
     () => files.reduce((acc, f) => acc + (f?.size ?? 0), 0),
     [files]
   );
+
+  const selectedLeaveTypeName =
+    activeLeaveTypes.find((x) => x.code === leaveTypeCode)?.name ?? leaveTypeCode ?? "—";
 
   return (
     <div className="space-y-4">
@@ -304,50 +245,43 @@ export default function StepSearch({
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-1">
               <label className="text-sm font-medium">Leave type</label>
+
+              {leaveTypesLoading ? (
+                <div className="text-sm text-neutral-500">Loading leave types…</div>
+              ) : leaveTypesError ? (
+                <div className="text-sm text-red-600">{leaveTypesError}</div>
+              ) : null}
+
               <select
                 className="w-full rounded-md border p-2 text-sm bg-white"
                 value={leaveTypeCode}
                 onChange={(e) => {
-                  setLeaveTypeCode(e.target.value);
+                  const code = e.target.value;
+                  setLeaveTypeCode(code);
+                  setState({ ...state, leaveTypeCode: code });
                   setEndManuallySet(false);
                 }}
+                disabled={leaveTypesLoading || activeLeaveTypes.length === 0}
               >
-                {leaveTypes.map((t) => (
+                {activeLeaveTypes.map((t) => (
                   <option key={t.code} value={t.code}>
                     {t.name}
                   </option>
                 ))}
               </select>
 
-              <div className="flex items-center gap-2 mt-2">
-                <span className="text-xs rounded-full bg-neutral-100 text-neutral-700 px-2 py-1">
-                  Pay: {selectedType ? selectedType.payCategory : "—"}
-                </span>
-                {selectedType?.defaultDays ? (
-                  <span className="text-xs rounded-full bg-blue-50 text-blue-900 border border-blue-200 px-2 py-1">
-                    Default: {selectedType.defaultDays} day(s)
-                  </span>
-                ) : (
-                  <span className="text-xs rounded-full bg-neutral-100 text-neutral-600 px-2 py-1">
-                    No default duration
-                  </span>
-                )}
+              <div className="text-xs text-neutral-500 mt-2">
+                Selected: <span className="font-medium">{selectedLeaveTypeName}</span>
               </div>
-
-              {requiresAttachment ? (
-                <div className="mt-2 text-xs text-neutral-500">
-                  This leave type requires a supporting document (e.g., medical certificate).
-                </div>
-              ) : null}
             </div>
 
             <div className="space-y-1">
               <label className="text-sm font-medium">
-                Reason {requiresReason ? <span className="text-red-600">*</span> : <span className="text-neutral-400">(optional)</span>}
+                Reason <span className="text-neutral-400">(optional for now)</span>
               </label>
               <input
                 className="w-full rounded-md border p-2 text-sm"
-                placeholder={requiresReason ? "Required for this leave type" : "Optional"}
+                placeholder="Optional (rules enforced in Step 2 / Review later)"
                 value={reason}
                 onChange={(e) => setReason(e.target.value)}
               />
@@ -361,11 +295,6 @@ export default function StepSearch({
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
               />
-              {selectedType?.defaultDays ? (
-                <div className="text-xs text-neutral-500">
-                  End date will auto-fill based on {selectedType.defaultDays} working day(s) unless you override it.
-                </div>
-              ) : null}
             </div>
 
             <div className="space-y-1">
@@ -379,108 +308,97 @@ export default function StepSearch({
                   setEndManuallySet(true);
                 }}
               />
-              {endManuallySet && selectedType?.defaultDays ? (
+              {endManuallySet ? (
                 <button
                   type="button"
                   className="mt-2 text-xs underline text-neutral-700 hover:text-neutral-900"
                   onClick={() => {
                     setEndManuallySet(false);
-                    if (startDate && selectedType.defaultDays) {
-                      setEndDate(addWorkingDays(startDate, selectedType.defaultDays));
-                    }
+                    if (startDate) setEndDate(addWorkingDays(startDate, 1));
                   }}
                 >
-                  Reset end date to default duration
+                  Reset end date
                 </button>
               ) : null}
             </div>
           </div>
 
-          {/* ✅ Real Attachment UI */}
-          {requiresAttachment ? (
-            <div className="rounded-lg border p-4 space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="font-medium text-sm">
-                    Attachment <span className="text-red-600">*</span>
-                  </div>
-                  <div className="text-sm text-neutral-500 mt-1">
-                    Upload supporting document(s). For MVP this stays local; later it will upload to Supabase Storage.
-                  </div>
+          {/* Attachment UI (still local for MVP) */}
+          <div className="rounded-lg border p-4 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="font-medium text-sm">Attachment (optional)</div>
+                <div className="text-sm text-neutral-500 mt-1">
+                  For MVP this stays local; later we’ll upload to Supabase Storage.
                 </div>
-
-                <button
-                  type="button"
-                  className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  Upload
-                </button>
               </div>
 
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                onChange={(e) => pickFiles(e.target.files)}
-              />
-
-              {files.length === 0 ? (
-                <div className="rounded-md border border-dashed p-4 text-sm text-neutral-500">
-                  No files uploaded yet. Click <span className="font-medium">Upload</span> to add documents.
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="text-xs text-neutral-500">
-                    {files.length} file(s) • Total: {formatBytes(totalAttachmentBytes)}
-                  </div>
-
-                  <div className="divide-y rounded-md border">
-                    {files.map((f, idx) => (
-                      <div
-                        key={`${f.name}-${f.size}-${f.lastModified}`}
-                        className="p-3 flex items-center justify-between gap-3"
-                      >
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium truncate">{f.name}</div>
-                          <div className="text-xs text-neutral-500">
-                            {formatBytes(f.size)}
-                            {f.type ? ` • ${f.type}` : ""}
-                          </div>
-                        </div>
-
-                        <button
-                          type="button"
-                          className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
-                          onClick={() => removeFile(idx)}
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="text-xs text-neutral-500">
-                    Tip: You can upload multiple documents (e.g., medical certificate + additional notes).
-                  </div>
-                </div>
-              )}
+              <button
+                type="button"
+                className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                Upload
+              </button>
             </div>
-          ) : null}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => pickFiles(e.target.files)}
+            />
+
+            {files.length === 0 ? (
+              <div className="rounded-md border border-dashed p-4 text-sm text-neutral-500">
+                No files uploaded yet. Click <span className="font-medium">Upload</span> to add documents.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="text-xs text-neutral-500">
+                  {files.length} file(s) • Total: {formatBytes(totalAttachmentBytes)}
+                </div>
+
+                <div className="divide-y rounded-md border">
+                  {files.map((f, idx) => (
+                    <div
+                      key={`${f.name}-${f.size}-${f.lastModified}`}
+                      className="p-3 flex items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate">{f.name}</div>
+                        <div className="text-xs text-neutral-500">
+                          {formatBytes(f.size)}
+                          {f.type ? ` • ${f.type}` : ""}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
+                        onClick={() => removeFile(idx)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="flex items-center justify-end gap-2 border-t pt-4">
             <button
               type="button"
               className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50"
               onClick={() => {
-                setLeaveTypeCode("ANNUAL");
                 setStartDate("");
                 setEndDate("");
                 setReason("");
                 setEndManuallySet(false);
                 setFiles([]);
-                setState({ ...state, attachments: [] });
+                setState({ ...state, attachments: [], startDate: "", endDate: "", reason: "" });
               }}
             >
               Reset
