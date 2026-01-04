@@ -1,6 +1,5 @@
 "use client";
 
-// components/dashboard/BalanceCards.tsx
 export type BalanceCardItem = {
   code: string;
   title: string;
@@ -27,12 +26,12 @@ export default function BalanceCards({
   items: BalanceCardItem[];
   loading?: boolean;
 }) {
-  if (loading && items.length === 0) {
+  if (loading && (!items || items.length === 0)) {
     return (
-      <div className="grid gap-4 md:grid-cols-3">
-        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
-        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
-        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading balances…</div>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading…</div>
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading…</div>
+        <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">Loading…</div>
       </div>
     );
   }
@@ -40,17 +39,14 @@ export default function BalanceCards({
   if (!items || items.length === 0) {
     return (
       <div className="rounded-xl border bg-white p-4 text-sm text-neutral-500">
-        No balance data available yet.
+        No balance data available.
       </div>
     );
   }
 
-  // Show first 3 cards, but keep DB-driven ordering (already sorted by name)
-  const top = items.slice(0, 3);
-
   return (
-    <div className="grid gap-4 md:grid-cols-3">
-      {top.map((it) => (
+    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {items.map((it) => (
         <BalanceCard
           key={it.code}
           title={it.title}

@@ -9,18 +9,39 @@ import BalanceCards, { type BalanceCardItem } from "@/components/dashboard/Balan
 import RequestsTable, { type RequestRow } from "@/components/dashboard/RequestsTable";
 import WhosOffToday, { type OffPerson } from "@/components/dashboard/WhosOffToday";
 
-type LeaveTypeRow = {
-  code: string;
-  name: string;
-  default_days: number | null;
-  active: boolean;
-};
+type Role = "staff" | "line_manager" | "general_manager" | "admin";
 
 type ProfileRow = {
   id: string;
   full_name: string | null;
   email: string | null;
+  role: Role;
   department_id: string | null;
+  grade_level?: number | null;
+};
+
+type PolicyRow = {
+  policy_year: number;
+  year_end_date: string; // date
+  carry_forward_limit: number;
+  carry_forward_expiry: string; // date
+  annual_entitlement: number;
+};
+
+type BalanceRow = {
+  user_id: string;
+  policy_year: number;
+  entitlement: number;
+  used: number; // numeric(6,2)
+  carried_forward: number;
+  carried_forward_used: number;
+};
+
+type LeaveTypeRow = {
+  code: string;
+  name: string;
+  default_days: number | null;
+  active: boolean;
 };
 
 function isoDate(d: Date) {
@@ -30,47 +51,54 @@ function isoDate(d: Date) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function startOfYearISO(year: number) {
-  return `${year}-01-01`;
-}
-
-function endOfYearISO(year: number) {
-  return `${year}-12-31`;
-}
-
 function mapDbStatusToBadge(db: string): RequestRow["status"] {
   const s = (db ?? "").toLowerCase();
-
   if (s === "draft") return "DRAFT";
   if (s === "approved") return "APPROVED";
   if (s === "rejected") return "REJECTED";
   if (s === "cancelled") return "CANCELLED";
-
-  // submitted / pending_lm / pending_gm => pending
-  return "PENDING";
+  return "PENDING"; // submitted/pending_lm/pending_gm
 }
 
-function formatBookingRef(id: string, createdAt?: string | null) {
+function bookingRef(id: string, createdAt?: string | null) {
   const year = createdAt ? new Date(createdAt).getFullYear() : new Date().getFullYear();
   return `LV-${year}-${id.slice(-6).toUpperCase()}`;
 }
 
+function canSeeDepartment(role: Role) {
+  return role === "line_manager" || role === "general_manager" || role === "admin";
+}
+
+function canSeeAll(role: Role) {
+  return role === "general_manager" || role === "admin";
+}
+
+function computeAnnualEntitlementFromGrade(grade?: number | null) {
+  if (grade == null || !Number.isFinite(grade)) return null;
+  if (grade >= 1 && grade <= 15) return 22;
+  if (grade >= 16) return 33;
+  return null;
+}
+
 export default function DashboardPage() {
+  const todayISO = useMemo(() => isoDate(new Date()), []);
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [me, setMe] = useState<{ userId: string; profile: ProfileRow } | null>(null);
+  const [profile, setProfile] = useState<ProfileRow | null>(null);
+  const [policy, setPolicy] = useState<PolicyRow | null>(null);
 
   const [balanceCards, setBalanceCards] = useState<BalanceCardItem[]>([]);
   const [recentRequests, setRecentRequests] = useState<RequestRow[]>([]);
   const [offToday, setOffToday] = useState<OffPerson[]>([]);
-
-  const todayISO = useMemo(() => isoDate(new Date()), []);
+  const [offNote, setOffNote] = useState<string | null>(null);
 
   useEffect(() => {
-    async function load() {
+    async function loadDashboard() {
       setLoading(true);
       setError(null);
+      setOffNote(null);
 
       try {
         // 1) Must be signed in
@@ -79,90 +107,153 @@ export default function DashboardPage() {
         const userId = userData.user?.id;
         if (!userId) throw new Error("Not signed in");
 
-        // 2) My profile (for department visibility)
+        const year = new Date().getFullYear();
+        const yearStart = `${year}-01-01`;
+        const yearEnd = `${year}-12-31`;
+
+        // 2) My profile (include grade_level)
         const { data: prof, error: profErr } = await supabase
           .from("profiles")
-          .select("id,full_name,email,department_id")
+          .select("id,full_name,email,role,department_id,grade_level")
           .eq("id", userId)
           .single();
 
         if (profErr) throw profErr;
+        const me = prof as ProfileRow;
+        setProfile(me);
 
-        const profile = prof as ProfileRow;
-        setMe({ userId, profile });
+        // 3) Policy (optional; for expiry/limit display)
+        const { data: pol, error: polErr } = await supabase
+          .from("leave_policies")
+          .select("policy_year,year_end_date,carry_forward_limit,carry_forward_expiry,annual_entitlement")
+          .eq("policy_year", year)
+          .maybeSingle();
 
-        // 3) Load active leave types (for balances)
-        const { data: types, error: typesErr } = await supabase
+        const polRow = (!polErr && pol ? (pol as PolicyRow) : null);
+        setPolicy(polRow);
+
+        // 4) Leave balances (for carry-forward cards + also useful for UI consistency)
+        const { data: bal, error: balErr } = await supabase
+          .from("leave_balances")
+          .select("user_id,policy_year,entitlement,used,carried_forward,carried_forward_used")
+          .eq("user_id", userId)
+          .eq("policy_year", year)
+          .maybeSingle();
+
+        if (balErr) throw balErr;
+        const b = (bal ?? null) as BalanceRow | null;
+
+        // 5) Load leave types (per-type cards)
+        const { data: ltRows, error: ltErr } = await supabase
           .from("leave_types")
           .select("code,name,default_days,active")
           .eq("active", true)
           .order("name", { ascending: true });
 
-        if (typesErr) throw typesErr;
+        if (ltErr) throw ltErr;
+        const leaveTypes = (ltRows ?? []) as LeaveTypeRow[];
 
-        const leaveTypes = (types ?? []) as LeaveTypeRow[];
-
-        // 4) Compute used days per leave type for current year (approved only)
-        const year = new Date().getFullYear();
-        const from = startOfYearISO(year);
-        const to = endOfYearISO(year);
-
-        const { data: usedRows, error: usedErr } = await supabase
+        // 6) Sum APPROVED leave usage per type for this user within this year
+        const { data: approvedRows, error: apprErr } = await supabase
           .from("leave_requests")
-          .select("leave_type,days,status,start_date,end_date")
+          .select("leave_type,days,start_date,end_date,status")
           .eq("requester_id", userId)
           .eq("status", "approved")
-          .lte("start_date", to)
-          .gte("end_date", from);
+          .gte("start_date", yearStart)
+          .lte("end_date", yearEnd);
 
-        if (usedErr) throw usedErr;
+        if (apprErr) throw apprErr;
 
         const usedByType = new Map<string, number>();
-        (usedRows ?? []).forEach((r: any) => {
-          const code = String(r.leave_type);
-          const days = Number(r.days ?? 0);
-          usedByType.set(code, (usedByType.get(code) ?? 0) + days);
-        });
+        for (const r of approvedRows ?? []) {
+          const code = String((r as any).leave_type ?? "").toUpperCase();
+          const days = Number((r as any).days ?? 0);
+          if (!code) continue;
+          usedByType.set(code, (usedByType.get(code) ?? 0) + (Number.isFinite(days) ? days : 0));
+        }
 
-        // Build balance cards (DB-driven)
-        const cards: BalanceCardItem[] = leaveTypes.map((lt) => {
-          const entitlement = lt.default_days; // can be null
-          const used = usedByType.get(lt.code) ?? 0;
+        // 7) Build cards per leave type
+        const gradeAnnual = computeAnnualEntitlementFromGrade(me.grade_level);
+        const policyAnnualFallback = polRow?.annual_entitlement ?? null;
 
-          const remaining =
-            typeof entitlement === "number" && Number.isFinite(entitlement)
-              ? Math.max(entitlement - used, 0)
-              : null;
+        const typeCards: BalanceCardItem[] = leaveTypes.map((lt) => {
+          const code = String(lt.code).toUpperCase();
+
+          // Entitlement rules:
+          // - Annual: grade rule (22/33), fallback to policy annual_entitlement, fallback to leave_types.default_days, else 0
+          // - Others: leave_types.default_days (if null -> 0)
+          let entitlement = 0;
+          if (code === "ANNUAL") {
+            entitlement =
+              gradeAnnual ??
+              policyAnnualFallback ??
+              (typeof lt.default_days === "number" ? lt.default_days : 0);
+          } else {
+            entitlement = typeof lt.default_days === "number" ? lt.default_days : 0;
+          }
+
+          const used = usedByType.get(code) ?? 0;
+          const remaining = Math.max(entitlement - used, 0);
+
+          const hintParts: string[] = [];
+          if (code === "ANNUAL") {
+            if (me.grade_level != null) hintParts.push(`Grade: ${me.grade_level}`);
+            if (gradeAnnual != null) hintParts.push(`Rule: ${gradeAnnual} days`);
+            else if (policyAnnualFallback != null) hintParts.push(`Policy: ${policyAnnualFallback} days`);
+          }
 
           return {
-            code: lt.code,
+            code,
             title: lt.name,
-            value: remaining === null ? "—" : String(remaining),
-            subtitle:
-              remaining === null
-                ? "No fixed entitlement"
-                : `Entitled: ${entitlement} day(s) • Used: ${used.toFixed(2)}`,
-            hint: `Based on approved leaves in ${year}.`,
+            value: `${remaining}`,
+            subtitle: `Entitled: ${entitlement} • Used: ${used.toFixed(2)}`,
+            hint: hintParts.length ? hintParts.join(" • ") : undefined,
           };
         });
 
-        setBalanceCards(cards);
+        // 8) Carry-forward cards (separate)
+        const cf = Number(b?.carried_forward ?? 0);
+        const cfUsed = Number(b?.carried_forward_used ?? 0);
+        const cfRemaining = Math.max(cf - cfUsed, 0);
 
-        // 5) Recent requests (DB-driven) – join leave type name and current approver
+        const carryCards: BalanceCardItem[] = [
+          {
+            code: "CARRY_FORWARD_REMAINING",
+            title: "Carry-forward remaining",
+            value: `${cfRemaining}`,
+            subtitle: `Carried: ${cf.toFixed(2)} • Used: ${cfUsed.toFixed(2)}`,
+            hint: polRow?.carry_forward_expiry
+              ? `Expires: ${polRow.carry_forward_expiry}`
+              : "Expiry configured in leave_policies",
+          },
+          {
+            code: "CARRY_FORWARD_EXPIRY",
+            title: "Carry-forward expiry",
+            value: polRow?.carry_forward_expiry ?? "—",
+            subtitle:
+              polRow?.carry_forward_limit != null
+                ? `Max carry-forward: ${polRow.carry_forward_limit} day(s)`
+                : "No policy configured",
+            hint: "Configured in leave_policies",
+          },
+        ];
+
+        setBalanceCards([...typeCards, ...carryCards]);
+
+        // 9) Recent requests (my own)
         const { data: reqRows, error: reqErr } = await supabase
           .from("leave_requests")
           .select(
             `
             id,
             created_at,
-            leave_type,
             start_date,
             end_date,
             days,
             status,
-            current_approver_id,
+            leave_type,
             lt:leave_types!leave_requests_leave_type_fkey(name,code),
-            approver:profiles!leave_requests_current_approver_id_fkey(full_name,email)
+            current_approver_id
           `
           )
           .eq("requester_id", userId)
@@ -171,32 +262,33 @@ export default function DashboardPage() {
 
         if (reqErr) throw reqErr;
 
-        const mappedRequests: RequestRow[] = (reqRows ?? []).map((r: any) => {
+        const mappedReq: RequestRow[] = (reqRows ?? []).map((r: any) => {
           const leaveTypeName = r?.lt?.name ?? r.leave_type;
           const badgeStatus = mapDbStatusToBadge(r.status);
 
-          const approverName =
-            r?.approver?.full_name?.trim() ||
-            r?.approver?.email?.trim() ||
-            (r.current_approver_id ? String(r.current_approver_id).slice(0, 8) : "—");
+          const approver =
+            badgeStatus === "DRAFT" ? "—" : badgeStatus === "PENDING" ? "Pending approval" : "—";
 
           return {
             id: String(r.id),
-            bookingRef: formatBookingRef(String(r.id), r.created_at ?? null),
+            bookingRef: bookingRef(String(r.id), r.created_at ?? null),
             leaveType: String(leaveTypeName),
             startDate: String(r.start_date),
             endDate: String(r.end_date),
             workingDays: Number(r.days ?? 0),
             status: badgeStatus,
-            approver: badgeStatus === "DRAFT" ? "—" : approverName,
+            approver,
           };
         });
 
-        setRecentRequests(mappedRequests);
+        setRecentRequests(mappedReq);
 
-        // 6) Who’s off today (same department) – approved + pending only
-        if (profile.department_id) {
-          const { data: offRows, error: offErr } = await supabase
+        // 10) Who’s off today (RLS-aware)
+        const role = me.role;
+
+        if (!canSeeDepartment(role)) {
+          // Staff: only show themselves (if off today)
+          const { data: mineToday, error: mineErr } = await supabase
             .from("leave_requests")
             .select(
               `
@@ -205,61 +297,109 @@ export default function DashboardPage() {
               end_date,
               status,
               leave_type,
-              department_id,
-              requester:profiles!leave_requests_requester_id_fkey(full_name,email),
-              lt:leave_types!leave_requests_leave_type_fkey(name,code),
-              dept:departments!leave_requests_department_id_fkey(name)
+              lt:leave_types!leave_requests_leave_type_fkey(name,code)
             `
             )
-            .eq("department_id", profile.department_id)
+            .eq("requester_id", userId)
             .lte("start_date", todayISO)
             .gte("end_date", todayISO)
             .neq("status", "cancelled")
             .order("start_date", { ascending: true });
 
-          if (offErr) throw offErr;
+          if (mineErr) throw mineErr;
 
-          const people: OffPerson[] = (offRows ?? [])
+          const itemsOff: OffPerson[] = (mineToday ?? [])
             .map((r: any) => {
-              const s = (r.status ?? "").toLowerCase();
-              const uiStatus: OffPerson["status"] =
-                s === "approved" ? "APPROVED" : s.startsWith("pending") || s === "submitted" ? "PENDING" : "PENDING";
-
-              // Skip drafts
+              const s = String(r.status ?? "").toLowerCase();
               if (s === "draft") return null;
 
-              const name =
-                r?.requester?.full_name?.trim() ||
-                r?.requester?.email?.trim() ||
-                "Employee";
-
-              const deptName = r?.dept?.name?.trim() || "Department";
-              const leaveTypeName = r?.lt?.name?.trim() || r.leave_type;
+              const uiStatus: OffPerson["status"] = s === "approved" ? "APPROVED" : "PENDING";
+              const ltName = r?.lt?.name ?? r.leave_type;
 
               return {
-                name,
-                department: deptName,
-                leaveType: leaveTypeName,
+                name: me.full_name?.trim() || me.email?.trim() || "You",
+                department: "My department",
+                leaveType: String(ltName),
                 status: uiStatus,
               } satisfies OffPerson;
             })
             .filter(Boolean) as OffPerson[];
 
-          setOffToday(people);
+          setOffToday(itemsOff);
+
+          if (itemsOff.length === 0) {
+            setOffNote("Department view is available for Line Managers / GM / Admin.");
+          }
         } else {
-          setOffToday([]);
+          // LM => department. GM/Admin => all
+          if (!me.department_id && !canSeeAll(role)) {
+            setOffToday([]);
+            setOffNote("No department assigned to your profile.");
+          } else {
+            let q = supabase
+              .from("leave_requests")
+              .select(
+                `
+                id,
+                start_date,
+                end_date,
+                status,
+                leave_type,
+                department_id,
+                requester:profiles!leave_requests_requester_id_fkey(full_name,email),
+                lt:leave_types!leave_requests_leave_type_fkey(name,code),
+                dept:departments!leave_requests_department_id_fkey(name)
+              `
+              )
+              .lte("start_date", todayISO)
+              .gte("end_date", todayISO)
+              .neq("status", "cancelled")
+              .order("start_date", { ascending: true });
+
+            if (!canSeeAll(role)) {
+              q = q.eq("department_id", me.department_id);
+            }
+
+            const { data: offRows, error: offErr } = await q;
+            if (offErr) throw offErr;
+
+            const itemsOff: OffPerson[] = (offRows ?? [])
+              .map((r: any) => {
+                const s = String(r.status ?? "").toLowerCase();
+                if (s === "draft") return null;
+
+                const uiStatus: OffPerson["status"] = s === "approved" ? "APPROVED" : "PENDING";
+                const name =
+                  r?.requester?.full_name?.trim() || r?.requester?.email?.trim() || "Employee";
+                const deptName = r?.dept?.name?.trim() || "Department";
+                const ltName = r?.lt?.name?.trim() || r.leave_type;
+
+                return {
+                  name,
+                  department: deptName,
+                  leaveType: String(ltName),
+                  status: uiStatus,
+                } satisfies OffPerson;
+              })
+              .filter(Boolean) as OffPerson[];
+
+            setOffToday(itemsOff);
+            setOffNote(null);
+          }
         }
       } catch (e: any) {
         setError(e?.message ?? "Failed to load dashboard");
         setBalanceCards([]);
         setRecentRequests([]);
         setOffToday([]);
+        setOffNote(null);
       } finally {
         setLoading(false);
       }
     }
 
-    load();
+    loadDashboard();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [todayISO]);
 
   return (
@@ -269,11 +409,18 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-2xl font-semibold">Dashboard</h1>
           <p className="text-sm text-neutral-500 mt-1">
-            View balances, recent requests, and team availability.
+            Balances, recent requests, and availability (database + RLS).
           </p>
-          {me?.profile?.full_name ? (
+          {profile?.full_name ? (
             <div className="text-xs text-neutral-500 mt-1">
-              Signed in as <span className="font-medium">{me.profile.full_name}</span>
+              Signed in as <span className="font-medium">{profile.full_name}</span> • Role:{" "}
+              <span className="font-medium">{profile.role}</span>
+              {profile.grade_level != null ? (
+                <>
+                  {" "}
+                  • Grade: <span className="font-medium">{profile.grade_level}</span>
+                </>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -300,25 +447,19 @@ export default function DashboardPage() {
         </div>
       ) : null}
 
-      {/* Balance cards */}
+      {/* Balance cards (PER LEAVE TYPE + Carry Forward) */}
       <BalanceCards items={balanceCards} loading={loading} />
 
       {/* Main grid */}
       <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
         <RequestsTable rows={recentRequests} loading={loading} />
-        <div className="space-y-4">
-          <WhosOffToday items={offToday} loading={loading} />
 
-          <div className="rounded-xl border bg-white p-4">
-            <div className="font-semibold">Quick tips</div>
-            <ul className="mt-2 text-sm text-neutral-700 list-disc pl-5 space-y-1">
-              <li>
-                Use <span className="font-medium">Smart Apply</span> to consume buckets intelligently.
-              </li>
-              <li>Check the calendar before booking to avoid team conflicts.</li>
-              <li>Pending approvals can escalate after 7 days (policy).</li>
-            </ul>
-          </div>
+        <div className="space-y-4">
+          {offNote ? (
+            <div className="rounded-xl border bg-white p-3 text-xs text-neutral-600">{offNote}</div>
+          ) : null}
+
+          <WhosOffToday items={offToday} loading={loading} />
         </div>
       </div>
     </div>
