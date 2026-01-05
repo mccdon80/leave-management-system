@@ -45,7 +45,7 @@ export default function BalanceCards({
   }
 
   return (
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
       {items.map((it) => (
         <BalanceCard
           key={it.code}

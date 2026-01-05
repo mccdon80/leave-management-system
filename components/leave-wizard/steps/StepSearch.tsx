@@ -5,20 +5,16 @@ import type { WizardState } from "../SummaryPanel";
 
 type LeaveTypeRow = { code: string; name: string; requires_attachment?: boolean };
 
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
-}
-
-function toISODate(d: Date) {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
 function fromISODate(s: string) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, (m || 1) - 1, d || 1);
 }
 
-// Mon–Fri working days for MVP
+function toISODate(d: Date) {
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
 function addWorkingDays(startISO: string, workingDays: number) {
   if (!startISO) return "";
   if (workingDays <= 1) return startISO;
@@ -28,11 +24,10 @@ function addWorkingDays(startISO: string, workingDays: number) {
 
   while (remaining > 0) {
     d.setDate(d.getDate() + 1);
-    const dow = d.getDay(); // 0=Sun..6=Sat
+    const dow = d.getDay();
     const isWeekend = dow === 0 || dow === 6;
     if (!isWeekend) remaining--;
   }
-
   return toISODate(d);
 }
 
@@ -65,13 +60,7 @@ function formatBytes(bytes: number) {
   return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function Banner({
-  tone,
-  children,
-}: {
-  tone: "info" | "warn" | "error";
-  children: ReactNode;
-}) {
+function Banner({ tone, children }: { tone: "info" | "warn" | "error"; children: ReactNode }) {
   const cls =
     tone === "error"
       ? "bg-red-50 text-red-700 border-red-200"
@@ -99,28 +88,23 @@ export default function StepSearch({
 }: {
   state: WizardState;
   setState: (next: WizardState) => void;
-  onSearch?: () => void;
+  onSearch?: (next: WizardState) => void;
   leaveTypes: LeaveTypeRow[];
   leaveTypesLoading?: boolean;
   leaveTypesError?: string | null;
 }) {
   const activeLeaveTypes = useMemo(() => (leaveTypes ?? []).filter(Boolean), [leaveTypes]);
 
-  // DB code (keep as-is, e.g. "SICK_FULL")
   const [leaveTypeCode, setLeaveTypeCode] = useState<string>(state.leaveTypeCode ?? "");
-
   const [startDate, setStartDate] = useState<string>(state.startDate ?? "");
   const [endDate, setEndDate] = useState<string>(state.endDate ?? "");
   const [reason, setReason] = useState<string>(state.reason ?? "");
 
-  // Attachment state (UI-first)
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Track if user manually edited end date
   const [endManuallySet, setEndManuallySet] = useState<boolean>(false);
 
-  // Sync local state from wizard when navigating back/forward
   useEffect(() => {
     setLeaveTypeCode(state.leaveTypeCode ?? "");
     setStartDate(state.startDate ?? "");
@@ -129,7 +113,6 @@ export default function StepSearch({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.leaveTypeCode, state.startDate, state.endDate, state.reason]);
 
-  // If leave types load and user hasn't picked any yet, choose first
   useEffect(() => {
     if (!leaveTypeCode && activeLeaveTypes.length > 0) {
       const first = activeLeaveTypes[0].code;
@@ -141,17 +124,16 @@ export default function StepSearch({
 
   const workingDays = useMemo(() => countWorkingDays(startDate, endDate), [startDate, endDate]);
 
-  const withinCarryWindow = true; // mock until policy wiring
-  const currentYearRemaining = 18; // mock
-  const carryForwardRemaining = withinCarryWindow ? 4 : 0; // mock
+  // ✅ DB-backed values (populated by LeaveWizard)
+  const currentYearRemaining = state.currentYearRemaining;
+  const carryForwardRemaining = state.carryForwardRemaining;
+  const withinCarryWindow = state.withinCarryWindow;
 
-  // ✅ Determine if attachments are required for selected leave type
   const requiresAttachment = useMemo(() => {
     const selected = activeLeaveTypes.find((t) => t.code === leaveTypeCode);
     return Boolean(selected?.requires_attachment);
   }, [activeLeaveTypes, leaveTypeCode]);
 
-  // ✅ If user switches to a type that does NOT require attachments, clear attachment state
   useEffect(() => {
     if (!requiresAttachment) {
       if (files.length > 0 || (state.attachments?.length ?? 0) > 0) {
@@ -166,28 +148,27 @@ export default function StepSearch({
   const blocks: string[] = [];
   const warnings: string[] = [];
 
-  if (!leaveTypeCode) {
-    blocks.push("Please select a leave type.");
-  }
+  if (!leaveTypeCode) blocks.push("Please select a leave type.");
 
   if (startDate && endDate && fromISODate(endDate) < fromISODate(startDate)) {
     blocks.push("End date cannot be before start date.");
   }
 
-  if (withinCarryWindow && carryForwardRemaining > 0) {
-    warnings.push("Carry-forward expires on Mar 31 (policy).");
-  }
-
-  // ✅ Blocking: attachment required but none uploaded
   if (requiresAttachment && (state.attachments?.length ?? 0) === 0) {
     blocks.push("Attachment is required for this leave type.");
+  }
+
+  if (withinCarryWindow && (carryForwardRemaining ?? 0) > 0 && state.carryForwardExpiry) {
+    warnings.push(`Carry-forward expires on ${state.carryForwardExpiry} (policy).`);
+  }
+  if (withinCarryWindow === false && (carryForwardRemaining ?? 0) > 0 && state.carryForwardExpiry) {
+    warnings.push(`Carry-forward expired on ${state.carryForwardExpiry} (policy).`);
   }
 
   function pickFiles(next: FileList | null) {
     if (!next) return;
 
     const existing = new Set(files.map((f) => `${f.name}-${f.size}-${f.lastModified}`));
-
     const incoming = Array.from(next).filter((f) => {
       const key = `${f.name}-${f.size}-${f.lastModified}`;
       if (existing.has(key)) return false;
@@ -232,25 +213,27 @@ export default function StepSearch({
       endDate,
       reason,
       workingDays,
-      withinCarryWindow,
-      currentYearRemaining,
-      carryForwardRemaining,
       blocks,
       warnings,
       attachments: state.attachments ?? [],
     };
 
     setState(next);
-    onSearch?.();
+    onSearch?.(next);
   }
 
-  const totalAttachmentBytes = useMemo(
-    () => files.reduce((acc, f) => acc + (f?.size ?? 0), 0),
-    [files]
-  );
+  const totalAttachmentBytes = useMemo(() => files.reduce((acc, f) => acc + (f?.size ?? 0), 0), [files]);
 
   const selectedLeaveTypeName =
     activeLeaveTypes.find((x) => x.code === leaveTypeCode)?.name ?? leaveTypeCode ?? "—";
+
+  // Policy hint values (dynamic)
+  const policyYear = state.policyYear;
+  const yearStart = policyYear ? `${policyYear}-01-01` : "—";
+  const yearEnd = state.yearEndDate ?? "—";
+  const carryExpiry = state.carryForwardExpiry ?? "—";
+  const carryLimit =
+    typeof state.carryForwardLimit === "number" ? `${state.carryForwardLimit}` : "—";
 
   return (
     <div className="space-y-4">
@@ -354,7 +337,7 @@ export default function StepSearch({
             </div>
           </div>
 
-          {/* ✅ Attachment UI ONLY when required */}
+          {/* Attachment */}
           {requiresAttachment ? (
             <div className="rounded-lg border p-4 space-y-3">
               <div className="flex items-start justify-between gap-3">
@@ -374,13 +357,7 @@ export default function StepSearch({
                 </button>
               </div>
 
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                onChange={(e) => pickFiles(e.target.files)}
-              />
+              <input ref={fileInputRef} type="file" multiple className="hidden" onChange={(e) => pickFiles(e.target.files)} />
 
               {files.length === 0 ? (
                 <div className="rounded-md border border-dashed p-4 text-sm text-red-600">
@@ -395,10 +372,7 @@ export default function StepSearch({
 
                   <div className="divide-y rounded-md border">
                     {files.map((f, idx) => (
-                      <div
-                        key={`${f.name}-${f.size}-${f.lastModified}`}
-                        className="p-3 flex items-center justify-between gap-3"
-                      >
+                      <div key={`${f.name}-${f.size}-${f.lastModified}`} className="p-3 flex items-center justify-between gap-3">
                         <div className="min-w-0">
                           <div className="text-sm font-medium truncate">{f.name}</div>
                           <div className="text-xs text-neutral-500">
@@ -449,7 +423,7 @@ export default function StepSearch({
           </div>
         </div>
 
-        {/* Live results panel */}
+        {/* Live results */}
         <div className="rounded-xl border bg-white p-4 space-y-3">
           <div className="font-semibold">Live results</div>
 
@@ -460,11 +434,11 @@ export default function StepSearch({
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-neutral-500">Current-year balance</span>
-              <span className="font-semibold">{currentYearRemaining}</span>
+              <span className="font-semibold">{typeof currentYearRemaining === "number" ? currentYearRemaining : "—"}</span>
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-neutral-500">Carry-forward</span>
-              <span className="font-semibold">{carryForwardRemaining}</span>
+              <span className="font-semibold">{typeof carryForwardRemaining === "number" ? carryForwardRemaining : "—"}</span>
             </div>
 
             <div className="pt-2 border-t text-xs text-neutral-500">
@@ -473,31 +447,20 @@ export default function StepSearch({
           </div>
 
           {blocks.length ? (
-            <div className="space-y-2">
-              {blocks.map((b, i) => (
-                <Banner key={i} tone="error">
-                  {b}
-                </Banner>
-              ))}
-            </div>
+            <div className="space-y-2">{blocks.map((b, i) => <Banner key={i} tone="error">{b}</Banner>)}</div>
           ) : null}
 
           {warnings.length ? (
-            <div className="space-y-2">
-              {warnings.map((w, i) => (
-                <Banner key={i} tone="warn">
-                  {w}
-                </Banner>
-              ))}
-            </div>
+            <div className="space-y-2">{warnings.map((w, i) => <Banner key={i} tone="warn">{w}</Banner>)}</div>
           ) : null}
 
+          {/* Keep the same “Policy hints” box but dynamic */}
           <div className="rounded-lg border p-4">
-            <div className="font-medium text-sm">Policy hints (mock)</div>
+            <div className="font-medium text-sm">Policy hints</div>
             <ul className="mt-2 text-sm text-neutral-700 list-disc pl-5 space-y-1">
-              <li>Leave year: Jan 1 – Dec 31.</li>
-              <li>Carry-forward usable until Mar 31 (configurable).</li>
-              <li>Escalation after 7 days of no action (approvals).</li>
+              <li>Leave year: {yearStart} – {yearEnd}</li>
+              <li>Carry-forward usable until {carryExpiry} (limit {carryLimit} days)</li>
+              <li>Escalation: handled by approval workflow rules</li>
             </ul>
           </div>
         </div>

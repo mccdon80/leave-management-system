@@ -58,30 +58,55 @@ CREATE OR REPLACE FUNCTION "public"."apply_leave_balance_delta"() RETURNS "trigg
     AS $$
 declare
   v_year int;
+  v_contract uuid;
+  v_type text;
 begin
   v_year := extract(year from new.start_date)::int;
+  v_contract := new.contract_id;
+  v_type := new.leave_type;
 
-  -- Only act when status changes
+  if v_contract is null then
+    -- leave_requests_autofill should set contract_id, but fail safe:
+    select contract_id into v_contract from public.profiles where id = new.requester_id;
+  end if;
+
+  -- Only act on UPDATE
   if (tg_op = 'UPDATE') then
+
     -- approved transition
     if old.status <> 'approved' and new.status = 'approved' then
-      perform public.ensure_leave_balance(new.requester_id, v_year);
+      perform public.ensure_leave_balance_typed(new.requester_id, v_contract, v_year, v_type);
 
-      update public.leave_balances
+      update public.leave_balances lb
       set
-        used = used + new.used_current_year,
-        carried_forward_used = carried_forward_used + new.used_carry_forward
-      where user_id = new.requester_id and policy_year = v_year;
+        used = lb.used + new.used_current_year,
+        carried_forward_used =
+          case when v_type = 'ANNUAL'
+               then lb.carried_forward_used + new.used_carry_forward
+               else lb.carried_forward_used
+          end
+      where lb.user_id = new.requester_id
+        and lb.contract_id = v_contract
+        and lb.policy_year = v_year
+        and lb.leave_type = v_type;
     end if;
 
     -- cancellation of an approved leave
     if old.status = 'approved' and new.status = 'cancelled' then
-      update public.leave_balances
+      update public.leave_balances lb
       set
-        used = greatest(used - old.used_current_year, 0),
-        carried_forward_used = greatest(carried_forward_used - old.used_carry_forward, 0)
-      where user_id = old.requester_id and policy_year = v_year;
+        used = greatest(lb.used - old.used_current_year, 0),
+        carried_forward_used =
+          case when lb.leave_type = 'ANNUAL'
+               then greatest(lb.carried_forward_used - old.used_carry_forward, 0)
+               else lb.carried_forward_used
+          end
+      where lb.user_id = old.requester_id
+        and lb.contract_id = old.contract_id
+        and lb.policy_year = extract(year from old.start_date)::int
+        and lb.leave_type = old.leave_type;
     end if;
+
   end if;
 
   return new;
@@ -119,6 +144,88 @@ $$;
 ALTER FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer) RETURNS integer
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  with u as (
+    select grade_level
+    from public.profiles
+    where id = p_user_id
+  ),
+  rule as (
+    select r.annual_entitlement as entitlement
+    from public.leave_entitlement_rules r
+    cross join u
+    where r.active = true
+      and r.contract_id = p_contract_id
+      and (r.policy_year is null or r.policy_year = p_year)
+      and coalesce(r.leave_type, 'ANNUAL') = 'ANNUAL'
+      and u.grade_level is not null
+      and u.grade_level >= r.grade_min
+      and (r.grade_max is null or u.grade_level <= r.grade_max)
+    order by r.grade_min desc
+    limit 1
+  ),
+  policy as (
+    select lp.annual_entitlement as entitlement
+    from public.leave_policies lp
+    where lp.contract_id = p_contract_id
+      and lp.policy_year = p_year
+    limit 1
+  )
+  select coalesce(
+    (select entitlement from rule),
+    (select entitlement from policy),
+    0
+  );
+$$;
+
+
+ALTER FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."compute_leave_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") RETURNS integer
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  with u as (
+    select p.grade_level
+    from public.profiles p
+    where p.id = p_user_id
+  ),
+  rule as (
+    select r.annual_entitlement as entitlement
+    from public.leave_entitlement_rules r
+    cross join u
+    where r.active = true
+      and r.contract_id = p_contract_id
+      and (r.policy_year is null or r.policy_year = p_year)
+      and coalesce(r.leave_type, 'ANNUAL') = coalesce(p_leave_type, 'ANNUAL')
+      and u.grade_level is not null
+      and u.grade_level >= r.grade_min
+      and (r.grade_max is null or u.grade_level <= r.grade_max)
+    order by r.grade_min desc
+    limit 1
+  ),
+  policy as (
+    select lp.annual_entitlement as entitlement
+    from public.leave_policies lp
+    where lp.contract_id = p_contract_id
+      and lp.policy_year = p_year
+    limit 1
+  )
+  select coalesce(
+    (select entitlement from rule),
+    case when p_leave_type = 'ANNUAL' then (select entitlement from policy) else null end,
+    0
+  );
+$$;
+
+
+ALTER FUNCTION "public"."compute_leave_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."create_initial_leave_balance"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -126,7 +233,7 @@ CREATE OR REPLACE FUNCTION "public"."create_initial_leave_balance"() RETURNS "tr
 declare
   v_year int := extract(year from now())::int;
 begin
-  perform public.ensure_leave_balance(new.id, v_year);
+  perform public.ensure_leave_balances_for_user_year(new.id, v_year);
   return new;
 end;
 $$;
@@ -184,19 +291,126 @@ CREATE OR REPLACE FUNCTION "public"."ensure_leave_balance"("p_user_id" "uuid", "
     SET "search_path" TO 'public'
     AS $$
 declare
-  v_entitlement int;
+  v_contract uuid;
 begin
-  v_entitlement := public.compute_annual_entitlement(p_user_id);
+  select contract_id into v_contract
+  from public.profiles
+  where id = p_user_id;
 
-  insert into public.leave_balances (user_id, policy_year, entitlement, used, carried_forward, carried_forward_used)
-  values (p_user_id, p_year, v_entitlement, 0, 0, 0)
-  on conflict (user_id, policy_year)
-  do update set entitlement = excluded.entitlement;
+  if v_contract is null then
+    raise exception 'User % has no contract_id in profiles', p_user_id;
+  end if;
+
+  -- ANNUAL_CODE
+  perform public.ensure_leave_balance_typed(p_user_id, v_contract, p_year, 'ANNUAL');
 end;
 $$;
 
 
 ALTER FUNCTION "public"."ensure_leave_balance"("p_user_id" "uuid", "p_year" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."ensure_leave_balance_typed"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_entitlement int;
+begin
+  v_entitlement := public.compute_leave_entitlement(p_user_id, p_contract_id, p_year, p_leave_type);
+
+  insert into public.leave_balances (
+    user_id, contract_id, policy_year, leave_type,
+    entitlement, used, carried_forward, carried_forward_used
+  )
+  values (
+    p_user_id, p_contract_id, p_year, p_leave_type,
+    v_entitlement, 0, 0, 0
+  )
+  on conflict (user_id, contract_id, policy_year, leave_type)
+  do update set entitlement = excluded.entitlement;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."ensure_leave_balance_typed"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."ensure_leave_balances_for_user_year"("p_user_id" "uuid", "p_year" integer) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_contract uuid;
+  v_type text;
+begin
+  select contract_id into v_contract
+  from public.profiles
+  where id = p_user_id;
+
+  if v_contract is null then
+    raise exception 'User % has no contract_id in profiles', p_user_id;
+  end if;
+
+  for v_type in
+    select code from public.leave_types where active = true
+  loop
+    perform public.ensure_leave_balance_typed(p_user_id, v_contract, p_year, v_type);
+  end loop;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."ensure_leave_balances_for_user_year"("p_user_id" "uuid", "p_year" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."escalate_overdue_leave_requests"("p_cutoff" interval DEFAULT '7 days'::interval) RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    SET "row_security" TO 'off'
+    AS $$
+declare
+  v_now timestamptz := now();
+  v_count int := 0;
+begin
+  -- 9.1 Escalate pending LM -> GM
+  with upd as (
+    update public.leave_requests lr
+    set
+      status = 'pending_gm',
+      current_approver_id = lr.general_manager_id,
+      assigned_at = v_now
+    where lr.status = 'pending_lm'
+      and lr.assigned_at is not null
+      and lr.general_manager_id is not null
+      and lr.assigned_at <= (v_now - p_cutoff)
+    returning 1
+  )
+  select count(*) into v_count from upd;
+
+  -- 9.2 If requester is LM and GM overdue -> backup approver
+  with upd2 as (
+    update public.leave_requests lr
+    set
+      current_approver_id = p.backup_approver_id,
+      assigned_at = v_now
+    from public.profiles p
+    where lr.requester_id = p.id
+      and lr.status = 'pending_gm'
+      and lr.assigned_at is not null
+      and lr.assigned_at <= (v_now - p_cutoff)
+      and p.role = 'line_manager'
+      and p.backup_approver_id is not null
+    returning 1
+  )
+  select v_count + count(*) into v_count from upd2;
+
+  return v_count;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."escalate_overdue_leave_requests"("p_cutoff" interval) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
@@ -435,33 +649,54 @@ CREATE OR REPLACE FUNCTION "public"."rollover_leave_balances"("p_from_year" inte
     AS $$
 declare
   v_to_year int := p_from_year + 1;
-  v_limit int;
 begin
-  -- carry-forward limit from policy, fallback 5
-  select coalesce(carry_forward_limit, 5)
-    into v_limit
-  from public.leave_policies
-  where policy_year = p_from_year;
+  /*
+    For each active profile and each active leave type:
+      - entitlement for next year comes from rules/policy
+      - used resets to 0
+      - carried_forward only for ANNUAL (min(limit, remaining annual))
+  */
 
-  if v_limit is null then
-    v_limit := 5;
-  end if;
-
-  -- for every active profile, compute rollover
-  insert into public.leave_balances (user_id, policy_year, entitlement, used, carried_forward, carried_forward_used)
+  insert into public.leave_balances (
+    user_id, contract_id, policy_year, leave_type,
+    entitlement, used, carried_forward, carried_forward_used
+  )
   select
     p.id as user_id,
+    p.contract_id,
     v_to_year as policy_year,
-    public.compute_annual_entitlement(p.id) as entitlement,
-    0 as used,
-    least(v_limit, greatest((coalesce(lb.entitlement,0) - coalesce(lb.used,0))::numeric, 0)) as carried_forward,
-    0 as carried_forward_used
+    lt.code as leave_type,
+    public.compute_leave_entitlement(p.id, p.contract_id, v_to_year, lt.code) as entitlement,
+    0::numeric as used,
+    case
+      when lt.code = 'ANNUAL' then
+        least(
+          coalesce(lp.carry_forward_limit, 5)::numeric,
+          greatest(
+            (
+              coalesce(lb_prev.entitlement,0)::numeric
+              - coalesce(lb_prev.used,0)::numeric
+            ),
+            0
+          )
+        )
+      else 0::numeric
+    end as carried_forward,
+    0::numeric as carried_forward_used
   from public.profiles p
-  left join public.leave_balances lb
-    on lb.user_id = p.id
-   and lb.policy_year = p_from_year
+  join public.leave_types lt
+    on lt.active = true
+  left join public.leave_policies lp
+    on lp.contract_id = p.contract_id
+   and lp.policy_year = p_from_year
+  left join public.leave_balances lb_prev
+    on lb_prev.user_id = p.id
+   and lb_prev.contract_id = p.contract_id
+   and lb_prev.policy_year = p_from_year
+   and lb_prev.leave_type = 'ANNUAL'
   where p.is_active = true
-  on conflict (user_id, policy_year)
+    and p.contract_id is not null
+  on conflict (user_id, contract_id, policy_year, leave_type)
   do update set
     entitlement = excluded.entitlement,
     carried_forward = excluded.carried_forward;
@@ -565,7 +800,9 @@ CREATE TABLE IF NOT EXISTS "public"."leave_balances" (
     "carried_forward_used" numeric(6,2) DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "contract_id" "uuid"
+    "contract_id" "uuid" NOT NULL,
+    "leave_type" "text" NOT NULL,
+    CONSTRAINT "chk_leave_balances_carry_forward_annual_only" CHECK ((("leave_type" = 'ANNUAL'::"text") OR ((COALESCE("carried_forward", (0)::numeric) = (0)::numeric) AND (COALESCE("carried_forward_used", (0)::numeric) = (0)::numeric))))
 );
 
 
@@ -580,6 +817,8 @@ CREATE TABLE IF NOT EXISTS "public"."leave_entitlement_rules" (
     "active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "contract_id" "uuid" NOT NULL,
+    "policy_year" integer,
+    "leave_type" "text",
     CONSTRAINT "chk_entitlement_nonneg" CHECK (("annual_entitlement" >= 0)),
     CONSTRAINT "chk_grade_range" CHECK ((("grade_max" IS NULL) OR ("grade_max" >= "grade_min")))
 );
@@ -629,6 +868,7 @@ CREATE TABLE IF NOT EXISTS "public"."leave_requests" (
     "contract_id" "uuid",
     CONSTRAINT "chk_dates" CHECK (("end_date" >= "start_date")),
     CONSTRAINT "chk_days_nonneg" CHECK (("days" >= (0)::numeric)),
+    CONSTRAINT "chk_leave_requests_carry_forward_annual_only" CHECK ((("leave_type" = 'ANNUAL'::"text") OR (COALESCE("used_carry_forward", (0)::numeric) = (0)::numeric))),
     CONSTRAINT "leave_requests_status_check" CHECK (("status" = ANY (ARRAY['draft'::"text", 'submitted'::"text", 'pending_lm'::"text", 'pending_gm'::"text", 'approved'::"text", 'rejected'::"text", 'cancelled'::"text"])))
 );
 
@@ -696,7 +936,7 @@ ALTER TABLE ONLY "public"."contracts"
 
 
 ALTER TABLE ONLY "public"."departments"
-    ADD CONSTRAINT "departments_name_key" UNIQUE ("name");
+    ADD CONSTRAINT "departments_contract_name_key" UNIQUE ("contract_id", "name");
 
 
 
@@ -716,12 +956,17 @@ ALTER TABLE ONLY "public"."leave_balances"
 
 
 ALTER TABLE ONLY "public"."leave_balances"
-    ADD CONSTRAINT "leave_balances_user_contract_year_key" UNIQUE ("user_id", "contract_id", "policy_year");
+    ADD CONSTRAINT "leave_balances_user_contract_year_type_key" UNIQUE ("user_id", "contract_id", "policy_year", "leave_type");
 
 
 
 ALTER TABLE ONLY "public"."leave_entitlement_rules"
     ADD CONSTRAINT "leave_entitlement_rules_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."leave_entitlement_rules"
+    ADD CONSTRAINT "leave_entitlement_rules_unique_band" UNIQUE ("contract_id", "policy_year", "leave_type", "grade_min", "grade_max");
 
 
 
@@ -903,6 +1148,11 @@ ALTER TABLE ONLY "public"."leave_entitlement_rules"
 
 
 
+ALTER TABLE ONLY "public"."leave_entitlement_rules"
+    ADD CONSTRAINT "leave_entitlement_rules_leave_type_fkey" FOREIGN KEY ("leave_type") REFERENCES "public"."leave_types"("code") ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+
 ALTER TABLE ONLY "public"."leave_policies"
     ADD CONSTRAINT "leave_policies_contract_id_fkey" FOREIGN KEY ("contract_id") REFERENCES "public"."contracts"("id") ON DELETE CASCADE;
 
@@ -996,9 +1246,9 @@ CREATE POLICY "audit_no_update" ON "public"."audit_log" FOR UPDATE TO "authentic
 
 
 
-CREATE POLICY "audit_select" ON "public"."audit_log" FOR SELECT TO "authenticated" USING (("public"."is_gm"() OR ("actor_id" = "auth"."uid"()) OR (("entity" = 'leave_requests'::"text") AND (EXISTS ( SELECT 1
+CREATE POLICY "audit_select" ON "public"."audit_log" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR ("actor_id" = "auth"."uid"()) OR (("entity" = 'leave_requests'::"text") AND (EXISTS ( SELECT 1
    FROM "public"."leave_requests" "lr"
-  WHERE (("lr"."id" = "audit_log"."entity_id") AND ("lr"."requester_id" = "auth"."uid"())))))));
+  WHERE (("lr"."id" = "audit_log"."entity_id") AND ("lr"."contract_id" = "public"."my_contract_id"()) AND (("lr"."requester_id" = "auth"."uid"()) OR "public"."is_gm"() OR ("public"."is_line_manager"() AND ("lr"."department_id" IS NOT NULL) AND ("lr"."department_id" = "public"."my_department_id"())) OR ("lr"."current_approver_id" = "auth"."uid"()))))))));
 
 
 
@@ -1036,7 +1286,7 @@ CREATE POLICY "departments_admin_write" ON "public"."departments" TO "authentica
 
 
 
-CREATE POLICY "departments_select_authenticated" ON "public"."departments" FOR SELECT TO "authenticated" USING (true);
+CREATE POLICY "departments_select_authenticated" ON "public"."departments" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR ("contract_id" = "public"."my_contract_id"())));
 
 
 
@@ -1057,7 +1307,7 @@ CREATE POLICY "leave_approvals_insert_approver" ON "public"."leave_approvals" FO
 
 CREATE POLICY "leave_approvals_select_via_request" ON "public"."leave_approvals" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."leave_requests" "lr"
-  WHERE (("lr"."id" = "leave_approvals"."leave_request_id") AND (("lr"."requester_id" = "auth"."uid"()) OR "public"."is_gm"() OR ("public"."is_line_manager"() AND ("lr"."department_id" IS NOT NULL) AND ("lr"."department_id" = "public"."my_department_id"())))))));
+  WHERE (("lr"."id" = "leave_approvals"."leave_request_id") AND ("public"."is_super_admin"() OR (("lr"."contract_id" = "public"."my_contract_id"()) AND (("lr"."requester_id" = "auth"."uid"()) OR "public"."is_gm"() OR ("public"."is_line_manager"() AND ("lr"."department_id" IS NOT NULL) AND ("lr"."department_id" = "public"."my_department_id"())) OR ("lr"."current_approver_id" = "auth"."uid"()))))))));
 
 
 
@@ -1072,9 +1322,9 @@ CREATE POLICY "leave_balances_admin_write" ON "public"."leave_balances" FOR INSE
 
 
 
-CREATE POLICY "leave_balances_select_access" ON "public"."leave_balances" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."is_gm"() OR ("public"."is_line_manager"() AND (EXISTS ( SELECT 1
+CREATE POLICY "leave_balances_select_access" ON "public"."leave_balances" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR (("contract_id" = "public"."my_contract_id"()) AND (("user_id" = "auth"."uid"()) OR "public"."is_gm"() OR ("public"."is_line_manager"() AND (EXISTS ( SELECT 1
    FROM "public"."profiles" "p"
-  WHERE (("p"."id" = "leave_balances"."user_id") AND ("p"."department_id" = "public"."my_department_id"())))))));
+  WHERE (("p"."id" = "leave_balances"."user_id") AND ("p"."department_id" = "public"."my_department_id"()) AND ("p"."contract_id" = "public"."my_contract_id"())))))))));
 
 
 
@@ -1088,7 +1338,7 @@ CREATE POLICY "leave_policies_admin_write" ON "public"."leave_policies" TO "auth
 
 
 
-CREATE POLICY "leave_policies_select_authenticated" ON "public"."leave_policies" FOR SELECT TO "authenticated" USING (true);
+CREATE POLICY "leave_policies_select_authenticated" ON "public"."leave_policies" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR ("contract_id" = "public"."my_contract_id"())));
 
 
 
@@ -1145,7 +1395,7 @@ CREATE POLICY "profiles_admin_update" ON "public"."profiles" FOR UPDATE TO "auth
 
 
 
-CREATE POLICY "profiles_manager_select_department" ON "public"."profiles" FOR SELECT TO "authenticated" USING (("public"."is_gm"() OR ("public"."is_line_manager"() AND ("department_id" IS NOT NULL) AND ("department_id" = "public"."my_department_id"()))));
+CREATE POLICY "profiles_manager_select_department" ON "public"."profiles" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR (("contract_id" = "public"."my_contract_id"()) AND ("public"."is_gm"() OR ("public"."is_line_manager"() AND ("department_id" IS NOT NULL) AND ("department_id" = "public"."my_department_id"()))))));
 
 
 
@@ -1331,6 +1581,17 @@ GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") 
 
 
 
+REVOKE ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."compute_leave_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."compute_leave_entitlement"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "anon";
 GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "service_role";
@@ -1349,9 +1610,23 @@ GRANT ALL ON FUNCTION "public"."enforce_profile_contract_consistency"() TO "serv
 
 
 
-GRANT ALL ON FUNCTION "public"."ensure_leave_balance"("p_user_id" "uuid", "p_year" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."ensure_leave_balance"("p_user_id" "uuid", "p_year" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."ensure_leave_balance"("p_user_id" "uuid", "p_year" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."ensure_leave_balance_typed"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."ensure_leave_balance_typed"("p_user_id" "uuid", "p_contract_id" "uuid", "p_year" integer, "p_leave_type" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."ensure_leave_balances_for_user_year"("p_user_id" "uuid", "p_year" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."ensure_leave_balances_for_user_year"("p_user_id" "uuid", "p_year" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."escalate_overdue_leave_requests"("p_cutoff" interval) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."escalate_overdue_leave_requests"("p_cutoff" interval) TO "service_role";
 
 
 
@@ -1433,7 +1708,6 @@ GRANT ALL ON FUNCTION "public"."my_department_id"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."rollover_leave_balances"("p_from_year" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."rollover_leave_balances"("p_from_year" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."rollover_leave_balances"("p_from_year" integer) TO "service_role";
 

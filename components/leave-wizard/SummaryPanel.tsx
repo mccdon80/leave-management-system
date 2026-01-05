@@ -3,6 +3,13 @@
 export type WizardState = {
   contractName?: string;
 
+  userRole?: string;
+  policyYear?: number;
+  yearEndDate?: string;
+
+  carryForwardExpiry?: string;
+  carryForwardLimit?: number;
+
   leaveTypeCode?: string;
   startDate?: string;
   endDate?: string;
@@ -10,7 +17,6 @@ export type WizardState = {
 
   workingDays?: number;
 
-  // balances (mock for UI)
   currentYearRemaining?: number;
   carryForwardRemaining?: number;
   withinCarryWindow?: boolean;
@@ -25,12 +31,11 @@ export type WizardState = {
   status?: "DRAFT" | "PENDING";
 
   attachments?: {
-  name: string;
-  size: number;
-  type: string;
-  lastModified: number;
-}[];
-
+    name: string;
+    size: number;
+    type: string;
+    lastModified: number;
+  }[];
 };
 
 function pill(text: string, tone: "ok" | "warn" | "danger" = "ok") {
@@ -60,7 +65,7 @@ export default function SummaryPanel({ state }: { state: WizardState }) {
       <div className="mt-4 space-y-3 text-sm">
         <div className="flex items-center justify-between">
           <span className="text-neutral-500">Contract</span>
-          <span className="font-medium">{state.contractName || "Demo Contract"}</span>
+          <span className="font-medium">{state.contractName || "—"}</span>
         </div>
 
         <div className="flex items-center justify-between">
@@ -70,9 +75,7 @@ export default function SummaryPanel({ state }: { state: WizardState }) {
 
         <div className="flex items-center justify-between">
           <span className="text-neutral-500">Dates</span>
-          <span className="font-medium">
-            {hasDates ? `${state.startDate} → ${state.endDate}` : "—"}
-          </span>
+          <span className="font-medium">{hasDates ? `${state.startDate} → ${state.endDate}` : "—"}</span>
         </div>
 
         <div className="flex items-center justify-between">
@@ -81,7 +84,7 @@ export default function SummaryPanel({ state }: { state: WizardState }) {
         </div>
 
         <div className="border-t pt-3">
-          <div className="font-medium">Balances (mock)</div>
+          <div className="font-medium">Balances</div>
           <div className="mt-2 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-neutral-500">Current-year</span>
@@ -91,9 +94,14 @@ export default function SummaryPanel({ state }: { state: WizardState }) {
               <span className="text-neutral-500">Carry-forward</span>
               <span className="font-medium">{state.carryForwardRemaining ?? "—"}</span>
             </div>
+
             {state.withinCarryWindow === false ? (
+              <div className="text-xs text-neutral-500">Carry-forward window is closed.</div>
+            ) : null}
+
+            {state.carryForwardExpiry ? (
               <div className="text-xs text-neutral-500">
-                Carry-forward usable window is closed (after Mar 31).
+                Carry-forward expiry: <span className="font-medium">{state.carryForwardExpiry}</span>
               </div>
             ) : null}
           </div>
