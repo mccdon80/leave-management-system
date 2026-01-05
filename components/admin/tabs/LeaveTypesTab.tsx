@@ -1,3 +1,4 @@
+// components/admin/tabs/LeaveTypesTab.tsx
 "use client";
 
 import { useMemo, useState } from "react";

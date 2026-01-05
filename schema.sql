@@ -52,6 +52,39 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
 
 
 
+CREATE TYPE "public"."audit_action" AS ENUM (
+    'CREATE',
+    'UPDATE',
+    'DELETE',
+    'OVERRIDE',
+    'SYSTEM'
+);
+
+
+ALTER TYPE "public"."audit_action" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."employee_role" AS ENUM (
+    'staff',
+    'line_manager',
+    'general_manager',
+    'contract_admin'
+);
+
+
+ALTER TYPE "public"."employee_role" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."leave_pay_category" AS ENUM (
+    'FULL',
+    'HALF',
+    'UNPAID'
+);
+
+
+ALTER TYPE "public"."leave_pay_category" OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."apply_leave_balance_delta"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -117,27 +150,62 @@ $$;
 ALTER FUNCTION "public"."apply_leave_balance_delta"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_manage_contract"("p_contract_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    AS $$
+  select exists (
+    select 1
+    from public.profiles p
+    where p.id = auth.uid()
+      and (
+        p.is_super_admin = true
+        or (p.contract_id = p_contract_id and p.role in ('admin','general_manager'))
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."can_manage_contract"("p_contract_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_read_contract"("p_contract_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    AS $$
+  select exists (
+    select 1
+    from public.profiles p
+    where p.id = auth.uid()
+      and (
+        p.is_super_admin = true
+        or p.contract_id = p_contract_id
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."can_read_contract"("p_contract_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") RETURNS integer
-    LANGUAGE "sql" STABLE SECURITY DEFINER
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  select coalesce(
-    (
-      select r.annual_entitlement
-      from public.profiles p
-      join public.leave_entitlement_rules r
-        on r.active = true
-       and p.grade_level is not null
-       and p.grade_level >= r.grade_min
-       and (r.grade_max is null or p.grade_level <= r.grade_max)
-      where p.id = p_user_id
-      order by r.grade_min desc
-      limit 1
-    ),
-    -- fallback if grade_level is null or no rule matches:
-    (select annual_entitlement from public.leave_policies where policy_year = extract(year from now())::int),
-    0
-  );
+declare
+  v_contract uuid;
+  v_year int := extract(year from now())::int;
+  v_ent int;
+begin
+  select contract_id into v_contract
+  from public.profiles
+  where id = p_user_id;
+
+  if v_contract is null then
+    return 0;
+  end if;
+
+  select public.compute_annual_entitlement(p_user_id, v_contract, v_year) into v_ent;
+  return coalesce(v_ent, 0);
+end;
 $$;
 
 
@@ -746,11 +814,31 @@ CREATE TABLE IF NOT EXISTS "public"."audit_log" (
     "entity_id" "uuid" NOT NULL,
     "action" "text" NOT NULL,
     "details" "jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "contract_id" "uuid"
 );
 
 
 ALTER TABLE "public"."audit_log" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."contract_admin_policies" (
+    "contract_id" "uuid" NOT NULL,
+    "carry_forward_max_days" integer DEFAULT 5 NOT NULL,
+    "carry_forward_usable_until_month" integer DEFAULT 3 NOT NULL,
+    "carry_forward_usable_until_day" integer DEFAULT 31 NOT NULL,
+    "general_manager_id" "uuid",
+    "default_backup_approver_id" "uuid",
+    "escalation_days" integer DEFAULT 7 NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cap_cf_day_chk" CHECK ((("carry_forward_usable_until_day" >= 1) AND ("carry_forward_usable_until_day" <= 31))),
+    CONSTRAINT "cap_cf_max_days_chk" CHECK (("carry_forward_max_days" >= 0)),
+    CONSTRAINT "cap_cf_month_chk" CHECK ((("carry_forward_usable_until_month" >= 1) AND ("carry_forward_usable_until_month" <= 12))),
+    CONSTRAINT "cap_escalation_days_chk" CHECK (("escalation_days" >= 0))
+);
+
+
+ALTER TABLE "public"."contract_admin_policies" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."contracts" (
@@ -769,7 +857,9 @@ CREATE TABLE IF NOT EXISTS "public"."departments" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "contract_id" "uuid" NOT NULL
+    "contract_id" "uuid" NOT NULL,
+    "line_manager_id" "uuid",
+    "backup_approver_id" "uuid"
 );
 
 
@@ -886,6 +976,8 @@ CREATE TABLE IF NOT EXISTS "public"."leave_types" (
     "pay_category" "text" DEFAULT 'FULL'::"text" NOT NULL,
     "requires_reason" boolean DEFAULT false NOT NULL,
     "active" boolean DEFAULT true NOT NULL,
+    "contract_id" "uuid",
+    "id" "uuid" NOT NULL,
     CONSTRAINT "leave_types_pay_category_check" CHECK (("pay_category" = ANY (ARRAY['FULL'::"text", 'HALF'::"text", 'UNPAID'::"text"])))
 );
 
@@ -915,6 +1007,109 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
 ALTER TABLE "public"."profiles" OWNER TO "postgres";
 
 
+CREATE OR REPLACE VIEW "public"."v_admin_audit_logs" WITH ("security_invoker"='true') AS
+ SELECT "a"."id",
+    "a"."contract_id",
+    "to_char"(("a"."created_at" AT TIME ZONE 'Asia/Dubai'::"text"), 'YYYY-MM-DD HH24:MI'::"text") AS "time",
+    COALESCE("p"."email", 'System'::"text") AS "actor",
+    "a"."action",
+        CASE
+            WHEN ("a"."entity_id" IS NULL) THEN "a"."entity"
+            ELSE (("a"."entity" || ':'::"text") || ("a"."entity_id")::"text")
+        END AS "target",
+    ("a"."details")::"text" AS "details"
+   FROM ("public"."audit_log" "a"
+     LEFT JOIN "public"."profiles" "p" ON (("p"."id" = "a"."actor_id")))
+  ORDER BY "a"."created_at" DESC;
+
+
+ALTER VIEW "public"."v_admin_audit_logs" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_carry_forward" WITH ("security_invoker"='true') AS
+ SELECT "contract_id",
+    "carry_forward_max_days" AS "maxDays",
+    "carry_forward_usable_until_month" AS "usableUntilMonth",
+    "carry_forward_usable_until_day" AS "usableUntilDay"
+   FROM "public"."contract_admin_policies" "cap";
+
+
+ALTER VIEW "public"."v_admin_carry_forward" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_contracts" WITH ("security_invoker"='true') AS
+ SELECT "c"."id",
+    "c"."name",
+    "c"."code",
+    "c"."active",
+    "cap"."general_manager_id" AS "generalManagerEmployeeId",
+    COALESCE(( SELECT "jsonb_agg"("jsonb_build_object"('id', "d"."id", 'name', "d"."name", 'lineManagerEmployeeId', "d"."line_manager_id", 'backupApproverEmployeeId', "d"."backup_approver_id") ORDER BY "d"."name") AS "jsonb_agg"
+           FROM "public"."departments" "d"
+          WHERE ("d"."contract_id" = "c"."id")), '[]'::"jsonb") AS "departments"
+   FROM ("public"."contracts" "c"
+     LEFT JOIN "public"."contract_admin_policies" "cap" ON (("cap"."contract_id" = "c"."id")));
+
+
+ALTER VIEW "public"."v_admin_contracts" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_employees" WITH ("security_invoker"='true') AS
+ SELECT "p"."id",
+    "p"."full_name" AS "name",
+    "p"."email",
+    COALESCE("d"."name", ''::"text") AS "department",
+    COALESCE("p"."grade_level", 0) AS "grade",
+    "p"."role",
+    "p"."is_active" AS "active",
+    "p"."contract_id"
+   FROM ("public"."profiles" "p"
+     LEFT JOIN "public"."departments" "d" ON (("d"."id" = "p"."department_id")));
+
+
+ALTER VIEW "public"."v_admin_employees" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_entitlements" WITH ("security_invoker"='true') AS
+ SELECT "id",
+    "contract_id",
+    "grade_min" AS "gradeMin",
+    "grade_max" AS "gradeMax",
+    "annual_entitlement" AS "annualDays"
+   FROM "public"."leave_entitlement_rules" "r";
+
+
+ALTER VIEW "public"."v_admin_entitlements" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_leave_types" WITH ("security_invoker"='true') AS
+ SELECT "id",
+    "contract_id",
+    "code",
+    "name",
+    "default_days" AS "defaultDays",
+    "pay_category" AS "payCategory",
+    "requires_reason" AS "requiresReason",
+    "requires_attachment" AS "requiresAttachment",
+    "active"
+   FROM "public"."leave_types" "lt";
+
+
+ALTER VIEW "public"."v_admin_leave_types" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."v_admin_routing" WITH ("security_invoker"='true') AS
+ SELECT "cap"."contract_id",
+    COALESCE("gm"."full_name", "gm"."email", 'Not set'::"text") AS "generalManager",
+    COALESCE("ba"."full_name", "ba"."email", 'None'::"text") AS "backupApprover",
+    "cap"."escalation_days" AS "escalationDays"
+   FROM (("public"."contract_admin_policies" "cap"
+     LEFT JOIN "public"."profiles" "gm" ON (("gm"."id" = "cap"."general_manager_id")))
+     LEFT JOIN "public"."profiles" "ba" ON (("ba"."id" = "cap"."default_backup_approver_id")));
+
+
+ALTER VIEW "public"."v_admin_routing" OWNER TO "postgres";
+
+
 ALTER TABLE ONLY "public"."approver_delegations"
     ADD CONSTRAINT "approver_delegations_pkey" PRIMARY KEY ("id");
 
@@ -922,6 +1117,11 @@ ALTER TABLE ONLY "public"."approver_delegations"
 
 ALTER TABLE ONLY "public"."audit_log"
     ADD CONSTRAINT "audit_log_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."contract_admin_policies"
+    ADD CONSTRAINT "contract_admin_policies_pkey" PRIMARY KEY ("contract_id");
 
 
 
@@ -995,7 +1195,27 @@ ALTER TABLE ONLY "public"."profiles"
 
 
 
+CREATE UNIQUE INDEX "contracts_code_ux" ON "public"."contracts" USING "btree" ("code");
+
+
+
+CREATE UNIQUE INDEX "departments_contract_name_ux" ON "public"."departments" USING "btree" ("contract_id", "name");
+
+
+
 CREATE INDEX "idx_audit_entity" ON "public"."audit_log" USING "btree" ("entity", "entity_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_audit_log_contract_id" ON "public"."audit_log" USING "btree" ("contract_id");
+
+
+
+CREATE INDEX "idx_cap_backup" ON "public"."contract_admin_policies" USING "btree" ("default_backup_approver_id");
+
+
+
+CREATE INDEX "idx_cap_gm" ON "public"."contract_admin_policies" USING "btree" ("general_manager_id");
 
 
 
@@ -1003,7 +1223,19 @@ CREATE INDEX "idx_delegations_delegator" ON "public"."approver_delegations" USIN
 
 
 
+CREATE INDEX "idx_departments_backup" ON "public"."departments" USING "btree" ("backup_approver_id");
+
+
+
 CREATE INDEX "idx_departments_contract" ON "public"."departments" USING "btree" ("contract_id");
+
+
+
+CREATE INDEX "idx_departments_contract_id" ON "public"."departments" USING "btree" ("contract_id");
+
+
+
+CREATE INDEX "idx_departments_lm" ON "public"."departments" USING "btree" ("line_manager_id");
 
 
 
@@ -1039,6 +1271,10 @@ CREATE INDEX "idx_leave_requests_status_approver" ON "public"."leave_requests" U
 
 
 
+CREATE INDEX "idx_leave_types_contract_id" ON "public"."leave_types" USING "btree" ("contract_id");
+
+
+
 CREATE INDEX "idx_profiles_contract" ON "public"."profiles" USING "btree" ("contract_id");
 
 
@@ -1063,11 +1299,19 @@ CREATE INDEX "idx_profiles_super_admin" ON "public"."profiles" USING "btree" ("i
 
 
 
+CREATE UNIQUE INDEX "leave_types_id_ux" ON "public"."leave_types" USING "btree" ("id");
+
+
+
 CREATE OR REPLACE TRIGGER "trg_audit_leave_approvals" AFTER INSERT OR DELETE OR UPDATE ON "public"."leave_approvals" FOR EACH ROW EXECUTE FUNCTION "public"."log_audit"();
 
 
 
 CREATE OR REPLACE TRIGGER "trg_audit_leave_requests" AFTER INSERT OR DELETE OR UPDATE ON "public"."leave_requests" FOR EACH ROW EXECUTE FUNCTION "public"."log_audit"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_contract_admin_policies_updated_at" BEFORE UPDATE ON "public"."contract_admin_policies" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -1118,8 +1362,38 @@ ALTER TABLE ONLY "public"."audit_log"
 
 
 
+ALTER TABLE ONLY "public"."audit_log"
+    ADD CONSTRAINT "audit_log_contract_id_fkey" FOREIGN KEY ("contract_id") REFERENCES "public"."contracts"("id") ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."contract_admin_policies"
+    ADD CONSTRAINT "contract_admin_policies_contract_id_fkey" FOREIGN KEY ("contract_id") REFERENCES "public"."contracts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."contract_admin_policies"
+    ADD CONSTRAINT "contract_admin_policies_default_backup_approver_id_fkey" FOREIGN KEY ("default_backup_approver_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."contract_admin_policies"
+    ADD CONSTRAINT "contract_admin_policies_general_manager_id_fkey" FOREIGN KEY ("general_manager_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."departments"
+    ADD CONSTRAINT "departments_backup_approver_id_fkey" FOREIGN KEY ("backup_approver_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."departments"
     ADD CONSTRAINT "departments_contract_id_fkey" FOREIGN KEY ("contract_id") REFERENCES "public"."contracts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."departments"
+    ADD CONSTRAINT "departments_line_manager_id_fkey" FOREIGN KEY ("line_manager_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
@@ -1198,6 +1472,11 @@ ALTER TABLE ONLY "public"."leave_requests"
 
 
 
+ALTER TABLE ONLY "public"."leave_types"
+    ADD CONSTRAINT "leave_types_contract_id_fkey" FOREIGN KEY ("contract_id") REFERENCES "public"."contracts"("id") ON DELETE RESTRICT;
+
+
+
 ALTER TABLE ONLY "public"."profiles"
     ADD CONSTRAINT "profiles_backup_approver_id_fkey" FOREIGN KEY ("backup_approver_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
@@ -1252,6 +1531,17 @@ CREATE POLICY "audit_select" ON "public"."audit_log" FOR SELECT TO "authenticate
 
 
 
+CREATE POLICY "cap_read" ON "public"."contract_admin_policies" FOR SELECT TO "authenticated" USING ("public"."can_read_contract"("contract_id"));
+
+
+
+CREATE POLICY "cap_rw" ON "public"."contract_admin_policies" TO "authenticated" USING ("public"."can_manage_contract"("contract_id")) WITH CHECK ("public"."can_manage_contract"("contract_id"));
+
+
+
+ALTER TABLE "public"."contract_admin_policies" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."contracts" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1259,7 +1549,15 @@ CREATE POLICY "contracts_admin_write" ON "public"."contracts" TO "authenticated"
 
 
 
+CREATE POLICY "contracts_read" ON "public"."contracts" FOR SELECT TO "authenticated" USING ("public"."can_read_contract"("id"));
+
+
+
 CREATE POLICY "contracts_select" ON "public"."contracts" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR ("id" = "public"."my_contract_id"())));
+
+
+
+CREATE POLICY "contracts_write" ON "public"."contracts" TO "authenticated" USING ("public"."can_manage_contract"("id")) WITH CHECK ("public"."can_manage_contract"("id"));
 
 
 
@@ -1286,7 +1584,23 @@ CREATE POLICY "departments_admin_write" ON "public"."departments" TO "authentica
 
 
 
+CREATE POLICY "departments_read" ON "public"."departments" FOR SELECT TO "authenticated" USING ("public"."can_read_contract"("contract_id"));
+
+
+
+CREATE POLICY "departments_rw" ON "public"."departments" TO "authenticated" USING ("public"."can_manage_contract"("contract_id")) WITH CHECK ("public"."can_manage_contract"("contract_id"));
+
+
+
 CREATE POLICY "departments_select_authenticated" ON "public"."departments" FOR SELECT TO "authenticated" USING (("public"."is_super_admin"() OR ("contract_id" = "public"."my_contract_id"())));
+
+
+
+CREATE POLICY "entitlement_read" ON "public"."leave_entitlement_rules" FOR SELECT TO "authenticated" USING ("public"."can_read_contract"("contract_id"));
+
+
+
+CREATE POLICY "entitlement_rw" ON "public"."leave_entitlement_rules" TO "authenticated" USING ("public"."can_manage_contract"("contract_id")) WITH CHECK ("public"."can_manage_contract"("contract_id"));
 
 
 
@@ -1368,6 +1682,14 @@ CREATE POLICY "leave_types_admin_write" ON "public"."leave_types" TO "authentica
 
 
 
+CREATE POLICY "leave_types_read" ON "public"."leave_types" FOR SELECT TO "authenticated" USING ("public"."can_read_contract"("contract_id"));
+
+
+
+CREATE POLICY "leave_types_rw" ON "public"."leave_types" TO "authenticated" USING ("public"."can_manage_contract"("contract_id")) WITH CHECK ("public"."can_manage_contract"("contract_id"));
+
+
+
 CREATE POLICY "leave_types_select_authenticated" ON "public"."leave_types" FOR SELECT TO "authenticated" USING (true);
 
 
@@ -1399,11 +1721,21 @@ CREATE POLICY "profiles_manager_select_department" ON "public"."profiles" FOR SE
 
 
 
+CREATE POLICY "profiles_read_same_contract" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles" "me"
+  WHERE (("me"."id" = "auth"."uid"()) AND (("me"."is_super_admin" = true) OR ("me"."contract_id" = "profiles"."contract_id"))))));
+
+
+
 CREATE POLICY "profiles_self_select" ON "public"."profiles" FOR SELECT TO "authenticated" USING (("id" = "auth"."uid"()));
 
 
 
 CREATE POLICY "profiles_self_update_limited" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("id" = "auth"."uid"())) WITH CHECK (("id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "profiles_update_self" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("id" = "auth"."uid"())) WITH CHECK (("id" = "auth"."uid"()));
 
 
 
@@ -1569,13 +1901,21 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."apply_leave_balance_delta"() TO "anon";
 GRANT ALL ON FUNCTION "public"."apply_leave_balance_delta"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."apply_leave_balance_delta"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."can_manage_contract"("p_contract_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_manage_contract"("p_contract_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."can_read_contract"("p_contract_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_read_contract"("p_contract_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_annual_entitlement"("p_user_id" "uuid") TO "service_role";
 
@@ -1592,19 +1932,16 @@ GRANT ALL ON FUNCTION "public"."compute_leave_entitlement"("p_user_id" "uuid", "
 
 
 
-GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "anon";
 GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_initial_leave_balance"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."current_role"() TO "anon";
 GRANT ALL ON FUNCTION "public"."current_role"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."current_role"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."enforce_profile_contract_consistency"() TO "anon";
 GRANT ALL ON FUNCTION "public"."enforce_profile_contract_consistency"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."enforce_profile_contract_consistency"() TO "service_role";
 
@@ -1636,7 +1973,6 @@ GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."is_admin"() TO "anon";
 GRANT ALL ON FUNCTION "public"."is_admin"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_admin"() TO "service_role";
 
@@ -1648,7 +1984,6 @@ GRANT ALL ON FUNCTION "public"."is_delegate_for"("delegator" "uuid") TO "service
 
 
 
-GRANT ALL ON FUNCTION "public"."is_gm"() TO "anon";
 GRANT ALL ON FUNCTION "public"."is_gm"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_gm"() TO "service_role";
 
@@ -1660,7 +1995,6 @@ GRANT ALL ON FUNCTION "public"."is_gm_of"("requester" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."is_line_manager"() TO "anon";
 GRANT ALL ON FUNCTION "public"."is_line_manager"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_line_manager"() TO "service_role";
 
@@ -1678,13 +2012,11 @@ GRANT ALL ON FUNCTION "public"."is_my_department"("dept" "uuid") TO "service_rol
 
 
 
-GRANT ALL ON FUNCTION "public"."is_super_admin"() TO "anon";
 GRANT ALL ON FUNCTION "public"."is_super_admin"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_super_admin"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."leave_requests_autofill"() TO "anon";
 GRANT ALL ON FUNCTION "public"."leave_requests_autofill"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."leave_requests_autofill"() TO "service_role";
 
@@ -1696,13 +2028,11 @@ GRANT ALL ON FUNCTION "public"."log_audit"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."my_contract_id"() TO "anon";
 GRANT ALL ON FUNCTION "public"."my_contract_id"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."my_contract_id"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."my_department_id"() TO "anon";
 GRANT ALL ON FUNCTION "public"."my_department_id"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."my_department_id"() TO "service_role";
 
@@ -1734,69 +2064,98 @@ GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."approver_delegations" TO "anon";
 GRANT ALL ON TABLE "public"."approver_delegations" TO "authenticated";
 GRANT ALL ON TABLE "public"."approver_delegations" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."audit_log" TO "anon";
 GRANT ALL ON TABLE "public"."audit_log" TO "authenticated";
 GRANT ALL ON TABLE "public"."audit_log" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."contracts" TO "anon";
+GRANT ALL ON TABLE "public"."contract_admin_policies" TO "authenticated";
+GRANT ALL ON TABLE "public"."contract_admin_policies" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."contracts" TO "authenticated";
 GRANT ALL ON TABLE "public"."contracts" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."departments" TO "anon";
 GRANT ALL ON TABLE "public"."departments" TO "authenticated";
 GRANT ALL ON TABLE "public"."departments" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_approvals" TO "anon";
 GRANT ALL ON TABLE "public"."leave_approvals" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_approvals" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_balances" TO "anon";
 GRANT ALL ON TABLE "public"."leave_balances" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_balances" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_entitlement_rules" TO "anon";
 GRANT ALL ON TABLE "public"."leave_entitlement_rules" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_entitlement_rules" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_policies" TO "anon";
 GRANT ALL ON TABLE "public"."leave_policies" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_policies" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_requests" TO "anon";
 GRANT ALL ON TABLE "public"."leave_requests" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_requests" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."leave_types" TO "anon";
 GRANT ALL ON TABLE "public"."leave_types" TO "authenticated";
 GRANT ALL ON TABLE "public"."leave_types" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."profiles" TO "anon";
 GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."profiles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_audit_logs" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_audit_logs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_carry_forward" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_carry_forward" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_contracts" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_contracts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_employees" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_employees" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_entitlements" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_entitlements" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_leave_types" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_leave_types" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_admin_routing" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_admin_routing" TO "service_role";
 
 
 
@@ -1807,7 +2166,6 @@ GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 
 
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
-ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "service_role";
 
@@ -1817,7 +2175,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQ
 
 
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "postgres";
-ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "service_role";
 
@@ -1827,7 +2184,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUN
 
 
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "postgres";
-ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
 
